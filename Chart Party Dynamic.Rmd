@@ -1,0 +1,362 @@
+---
+title: "Charty Party xFP"
+output: html_document
+date: "2026-10-13"
+---
+```{r, echo=FALSE}
+
+library(tidyverse)
+library(nflfastR)
+library(gt)
+library(ggthemes)
+library(ffopportunity)
+# load in the play-by-play data (2025/26)
+pbp26 <- load_pbp(2026)
+pbp25_26 <- load_pbp(2025:2026)
+# pbp20_26<- load_pbp(2020:2026)
+# pbp2k<- load_pbp(2016:2026)
+
+snaps <- nflreadr::load_snap_counts(2026)
+
+```
+
+
+```{r, echo=FALSE}
+
+Week <- 6
+
+ep <- ep_load(
+  season = 2026,
+  type = "weekly"
+) %>%
+  filter(
+    week >= pmax(1, Week - 3),
+    week <= Week
+  )
+
+Weeks_In_Sample <- length(unique(ep$week))
+
+Week_Label <- paste0(
+  "Weeks ",
+  max(1, Week - 3),
+  "-",
+  Week
+)
+
+receiver_xfp <- ep %>%
+  filter(position == "WR") %>%
+  group_by(
+    player_id,
+    full_name,
+    posteam
+  ) %>%
+  summarize(
+    games = n(),
+
+    targets = sum(
+      rec_attempt,
+      na.rm = TRUE
+    ),
+
+    xfp = sum(
+      rec_fantasy_points_exp,
+      na.rm = TRUE
+    ),
+
+    fpts = sum(
+      rec_fantasy_points,
+      na.rm = TRUE
+    ),
+
+    xfp_pg = xfp / games,
+    fpts_pg = fpts / games,
+
+    fpts_over_exp = fpts - xfp,
+
+    .groups = "drop"
+  ) %>%
+  filter(
+    targets >= 15
+  ) %>%
+  left_join(
+    teams_colors_logos,
+    by = c("posteam" = "team_abbr")
+  ) %>%
+  left_join(
+    teams_colors_logos %>%
+      select(
+        team_abbr,
+        team_logo_espn
+      ),
+    by = c("posteam" = "team_abbr")
+  )
+
+TE_xfp <- ep %>%
+  filter(position == "TE") %>%
+  group_by(
+    player_id,
+    full_name,
+    posteam
+  ) %>%
+  summarize(
+    games = n(),
+
+    targets = sum(
+      rec_attempt,
+      na.rm = TRUE
+    ),
+
+    xfp = sum(
+      rec_fantasy_points_exp,
+      na.rm = TRUE
+    ),
+
+    fpts = sum(
+      rec_fantasy_points,
+      na.rm = TRUE
+    ),
+
+    xfp_pg = xfp / games,
+    fpts_pg = fpts / games,
+
+    fpts_over_exp = fpts - xfp,
+
+    .groups = "drop"
+  ) %>%
+  filter(
+    targets >= 10
+  ) %>%
+  left_join(
+    teams_colors_logos,
+    by = c("posteam" = "team_abbr")
+  ) %>%
+  left_join(
+    teams_colors_logos %>%
+      select(
+        team_abbr,
+        team_logo_espn
+      ),
+    by = c("posteam" = "team_abbr")
+  )
+
+rb_xfp <- ep %>%
+  filter(position == "RB") %>%
+  group_by(
+    player_id,
+    full_name,
+    posteam
+  ) %>%
+  summarize(
+    games = n(),
+
+    opportunities = sum(
+      rush_attempt + rec_attempt,
+      na.rm = TRUE
+    ),
+
+    opp_pg = opportunities / games,
+
+    xfp = sum(
+      total_fantasy_points_exp,
+      na.rm = TRUE
+    ),
+
+    fp = sum(
+      total_fantasy_points,
+      na.rm = TRUE
+    ),
+
+    xfp_pg = xfp / games,
+
+    fp_pg = fp / games,
+
+    fp_over_exp = fp - xfp,
+
+    .groups = "drop"
+  ) %>%
+  filter(
+    opp_pg >= 6.5
+  ) %>%
+  left_join(
+    teams_colors_logos,
+    by = c("posteam" = "team_abbr")
+  )
+
+
+    
+```
+
+
+
+
+```{r RB xFP, echo=FALSE}
+ggplot( rb_xfp, aes( x = xfp_pg, y = fp_pg ) ) + geom_abline( slope = 1, intercept = 0, linetype = "dashed", color = "gray50" ) +
+  
+  nflplotR::geom_nfl_logos( aes(team_abbr = posteam), width = .025 ) + ggrepel::geom_text_repel( aes(label = full_name), size = 1.8, box.padding = 0.3, point.padding = 0.8, force = 1, force_pull = 0.2, segment.alpha = 0.3, segment.size = 0.25, seed = 123, max.overlaps = Inf ) + 
+  
+  annotate( "label", x = max(rb_xfp$xfp_pg, na.rm = TRUE) * .50, y = max(rb_xfp$fp_pg, na.rm = TRUE) * .85, label = "Efficient/Overperforming", fill = NA, color = "darkgreen", fontface = "bold", size = 2.25 ) + 
+  annotate( "label", x = min(rb_xfp$xfp_pg, na.rm = TRUE) + 15, y = min(rb_xfp$fp_pg, na.rm = TRUE) * 1.5, label = "Inefficient/Underperforming", fill = NA, color = "darkred", fontface = "bold", size = 2.25 ) + 
+  coord_cartesian( xlim = c( min(rb_xfp$xfp_pg, na.rm = TRUE) - 1, max(rb_xfp$xfp_pg, na.rm = TRUE) + 2 ) ) + 
+  labs( x = "Expected Fantasy Points Per Game", y = "Fantasy Points Per Game", title = "RB xFP vs Actual Fantasy Points", subtitle = paste0( Week_Label, ", Data via ffopportunity, @rohinmishra" ) ) + 
+  theme_bw() + theme( plot.title = element_text( size = 18, face = "bold", hjust = 0.5 ), plot.subtitle = element_text( size = 10, hjust = 0.5 ) )
+```
+
+
+
+
+
+
+
+```{r WR xFP, echo=FALSE}
+ggplot( receiver_xfp, aes( x = xfp_pg, y = fpts_pg ) ) + 
+  geom_abline( slope = 1, intercept = 0, linetype = "dashed", color = "gray50" ) + 
+  nflplotR::geom_nfl_logos( aes(team_abbr = posteam), width = .025 ) + 
+  ggrepel::geom_text_repel( aes(label = full_name), size = 1.8, box.padding = 0.3, point.padding = 0.8, force = 1, force_pull = 0.2, segment.alpha = 0.3, segment.size = 0.25, seed = 123, max.overlaps = Inf ) + 
+  annotate( "label", x = max(receiver_xfp$xfp_pg, na.rm = TRUE) * .35, 
+            y = max(receiver_xfp$xfp_pg*0.75, na.rm = TRUE), 
+            label = "Efficient/Overperforming", fill = NA, color = "darkgreen", fontface = "bold", size = 2.25 ) + 
+  annotate( "label", x = min(receiver_xfp$xfp_pg, na.rm = TRUE) + 18, 
+            y = min(receiver_xfp$xfp_pg, na.rm = TRUE), label = "Inefficient/Underperforming", fill = NA, color = "darkred", fontface = "bold", size = 2.25 ) + 
+  coord_cartesian( xlim = c( min(receiver_xfp$xfp_pg, na.rm = TRUE) - 1, max(receiver_xfp$xfp_pg, na.rm = TRUE) + 2 ) ) + 
+  labs( x = "Expected Fantasy Points Per Game", y = "Fantasy Points Per Game", title = "WR xFP vs Actual Fantasy Points", subtitle = paste0( Week_Label, ", Data via ffopportunity, @rohinmishra" ) ) + 
+  
+  theme_bw() + theme( plot.title = element_text( size = 18, face = "bold", hjust = 0.5 ), plot.subtitle = element_text( size = 10, hjust = 0.5 ) )
+
+
+```
+
+
+```{r TE_xFP, echo=FALSE}
+ggplot( TE_xfp, aes( x = xfp_pg, y = fpts_pg ) ) + geom_abline( slope = 1, intercept = 0, linetype = "dashed", color = "gray50" ) +
+  nflplotR::geom_nfl_logos( aes(team_abbr = posteam), width = .025 ) + 
+  ggrepel::geom_text_repel( aes(label = full_name), size = 1.8, box.padding = 0.3, point.padding = 0.8, force = 1, force_pull = 0.2, segment.alpha = 0.3, segment.size = 0.25, seed = 123, max.overlaps = Inf ) + 
+  annotate( "label", x = max(TE_xfp$xfp_pg, na.rm = TRUE) * .7, y = max(TE_xfp$xfp_pg, na.rm = TRUE), label = "Efficient/Overperforming", fill = NA, color = "darkgreen", fontface = "bold", size = 2.25 ) + 
+  annotate( "label", x = min(TE_xfp$xfp_pg, na.rm = TRUE) + 10, y = min(TE_xfp$xfp_pg, na.rm = TRUE) * 1.25, label = "Inefficient/Underperforming", fill = NA, color = "darkred", fontface = "bold", size = 2.25 ) + 
+  coord_cartesian( xlim = c( min(TE_xfp$xfp_pg, na.rm = TRUE) - 1, max(TE_xfp$xfp_pg, na.rm = TRUE) + 2 ) ) + 
+  labs( x = "Expected Fantasy Points Per Game", y = "Fantasy Points Per Game", title = "TE xFP vs Actual Fantasy Points", subtitle = paste0( Week_Label, ", Data via ffopportunity, @rohinmishra" ) ) + theme_bw() + theme( plot.title = element_text( size = 18, face = "bold", hjust = 0.5 ), plot.subtitle = element_text( size = 10, hjust = 0.5 ) )
+```
+
+```{r EPA/CPOE, echo=FALSE}
+  cpoe_pad <- 1.5
+
+qb_epa_cpoe <- pbp26 %>%
+  filter(
+    week >= Week-3,
+    week <= Week,
+    qb_dropback == 1,
+    !is.na(passer_player_name)
+  ) %>%
+  group_by(
+    passer_player_id,
+    passer_player_name
+  ) %>%
+  summarize(
+    team = last(posteam),
+
+    dropbacks = n(),
+
+    epa_play = mean(
+      epa,
+      na.rm = TRUE
+    ),
+
+    cpoe = mean(
+      cpoe,
+      na.rm = TRUE
+    ),
+
+    .groups = "drop"
+  ) %>%
+  filter(
+    dropbacks >= (12 * Weeks_In_Sample)
+  )
+
+ggplot(
+  qb_epa_cpoe,
+  aes(
+    x = cpoe,
+    y = epa_play
+  )
+) +
+  geom_hline(
+    yintercept = mean(
+      qb_epa_cpoe$epa_play,
+      na.rm = TRUE
+    ),
+    linetype = "dashed",
+    color = "gray60"
+  ) +
+  geom_vline(
+    xintercept = mean(
+      qb_epa_cpoe$cpoe,
+      na.rm = TRUE
+    ),
+    linetype = "dashed",
+    color = "gray60"
+  ) +
+  nflplotR::geom_nfl_logos(
+    aes(team_abbr = team),
+    width = .035
+  ) +
+ggrepel::geom_text_repel( aes(label = passer_player_name), size = 1.8, box.padding = 0.5, point.padding = 1, force = 1.1, force_pull = 0.2, segment.alpha = 0.3, segment.size = 0.25, seed = 123, max.overlaps = Inf ) +
+  annotate(
+    "label",
+    x = max(qb_epa_cpoe$cpoe, na.rm = TRUE) * 1.1,
+    y = max(qb_epa_cpoe$epa_play, na.rm = TRUE) * .95,
+    label = "HOOPERS",
+    fill = NA,
+    color = "#228B22",
+    fontface = "bold",
+    size = 2.25
+  ) +
+coord_cartesian(
+  xlim = c(
+    min(qb_epa_cpoe$cpoe, na.rm = TRUE) - cpoe_pad,
+    max(qb_epa_cpoe$cpoe, na.rm = TRUE) + cpoe_pad
+  )
+) +
+  annotate(
+    "label",
+    x = min(qb_epa_cpoe$cpoe, na.rm = TRUE) * 0.95,
+    y = min(qb_epa_cpoe$epa_play, na.rm = TRUE) * .95,
+    label = "POOPERS",
+    fill = NA,
+    color = "red",
+    fontface = "bold",
+    size = 2.25
+  ) +
+  labs(
+    x = "Completion Percentage Over Expected (CPOE)",
+    y = "EPA per Play",
+    title = "QB EPA/Play vs CPOE",
+    subtitle = paste0(Week_Label, ", Data via nflR, @rohinmishra" )
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(
+      size = 22,
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      size = 13,
+      hjust = 0.5
+    )
+  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
