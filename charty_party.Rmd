@@ -1,0 +1,416 @@
+---
+title: "Charty Party xFP"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 8, dpi = 200)
+
+# install.packages("ffopportunity", repos = c("https://ffverse.r-universe.dev", getOption("repos")))
+# install.packages(c("tidyverse", "nflreadr", "nflfastR", "nflplotR", "gt", "ggrepel"))
+
+library(tidyverse)
+library(nflreadr)
+library(nflfastR)
+library(nflplotR)
+library(gt)
+library(ggrepel)
+library(ffopportunity)
+
+# ======================= PARAMETERS =======================
+SEASON  <- 2026
+Week    <- 10            # last completed week to include
+N_WEEKS <- 4             # window = Weeks (Week - N_WEEKS + 1) to Week
+SCORING <- "ppr"         # chart scoring: "ppr", "half", "std"
+
+MIN_RB_OPP_PG <- 6.5     # RB opportunities (rush att + targets) per game
+MIN_WR_TGT    <- 15      # WR total targets in window
+MIN_TE_TGT    <- 10      # TE total targets in window
+MIN_QB_DB     <- 30      # QB pass attempts (xFP) / dropbacks (EPA-CPOE)
+
+CREDIT <- "@rohinmishra / rohinm.substack.com"
+# ==========================================================
+
+scoring_label <- c(ppr = "PPR", half = "Half-PPR", std = "Standard")[[SCORING]]
+```
+
+```{r data}
+# ---- 1) Week window: last N calendar weeks (byes = fewer games for that team) ----
+Start_Week <- max(1, Week - N_WEEKS + 1)
+Week_Label <- paste0("Weeks ", Start_Week, "-", Week)
+
+team_window <- load_schedules(SEASON) %>%
+  filter(game_type == "REG", !is.na(result),
+         week >= Start_Week, week <= Week) %>%
+  clean_homeaway() %>%
+  select(game_id, week, team)
+
+window_games <- unique(team_window$game_id)
+
+# ---- 2) Expected points (ffopportunity) ----
+ep_raw <- ep_load(season = SEASON, type = "weekly")
+
+ep <- ep_raw %>%
+  filter(week >= Start_Week, week <= Week)
+
+# ---- 3) Fill missing positions from the nflverse player table ----
+players <- load_players() %>% select(gsis_id, nfl_position = position)
+
+ep <- ep %>%
+  left_join(players, by = c("player_id" = "gsis_id")) %>%
+  mutate(position = coalesce(position, nfl_position))
+
+# ---- 4) Games played from snap counts (catches 0-target / 0-touch games) ----
+ids <- load_ff_playerids() %>%
+  filter(!is.na(gsis_id), !is.na(pfr_id)) %>%
+  distinct(gsis_id, pfr_id)
+
+snap_games <- load_snap_counts(SEASON) %>%
+  filter(game_id %in% window_games, offense_snaps > 0) %>%
+  inner_join(ids, by = c("pfr_player_id" = "pfr_id")) %>%
+  group_by(player_id = gsis_id) %>%
+  summarise(snap_games = n_distinct(game_id),
+            off_snaps  = sum(offense_snaps),
+            .groups = "drop")
+
+# ---- 5) Player summary: every fantasy / expected fantasy form ----
+sum_cols <- c(
+  "pass_attempt", "rush_attempt", "rec_attempt",
+  "receptions", "receptions_exp",
+  "pass_yards_gained", "pass_yards_gained_exp",
+  "rush_yards_gained", "rush_yards_gained_exp",
+  "rec_yards_gained",  "rec_yards_gained_exp", "rec_air_yards",
+  "pass_touchdown", "pass_touchdown_exp",
+  "rush_touchdown", "rush_touchdown_exp",
+  "rec_touchdown",  "rec_touchdown_exp",
+  "pass_interception", "pass_interception_exp",
+  "pass_fantasy_points", "pass_fantasy_points_exp",
+  "rush_fantasy_points", "rush_fantasy_points_exp",
+  "rec_fantasy_points",  "rec_fantasy_points_exp",
+  "total_fantasy_points", "total_fantasy_points_exp"
+)
+
+player_xfp <- ep %>%
+  arrange(player_id, week) %>%
+  group_by(player_id) %>%
+  summarise(
+    full_name = last(full_name),
+    position  = last(position),
+    posteam   = last(posteam),                           # current team for logo
+    teams     = paste(unique(posteam), collapse = "/"),  # flags traded players
+    ep_games  = n_distinct(game_id),
+    across(any_of(sum_cols), ~ sum(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  left_join(snap_games, by = "player_id") %>%
+  mutate(
+    games = pmax(coalesce(snap_games, 0L), ep_games),
+
+    # ffopportunity fantasy points are full PPR -> derive half / standard
+    ppr_fp   = total_fantasy_points,
+    ppr_xfp  = total_fantasy_points_exp,
+    half_fp  = ppr_fp  - 0.5 * receptions,
+    half_xfp = ppr_xfp - 0.5 * receptions_exp,
+    std_fp   = ppr_fp  - receptions,
+    std_xfp  = ppr_xfp - receptions_exp,
+
+    across(c(ends_with("_fp"), ends_with("_xfp"),
+             any_of(c("pass_fantasy_points", "pass_fantasy_points_exp",
+                      "rush_fantasy_points", "rush_fantasy_points_exp",
+                      "rec_fantasy_points",  "rec_fantasy_points_exp"))),
+           ~ .x / games, .names = "{.col}_pg"),
+
+    ppr_foe_pg  = ppr_fp_pg  - ppr_xfp_pg,
+    half_foe_pg = half_fp_pg - half_xfp_pg,
+    std_foe_pg  = std_fp_pg  - std_xfp_pg,
+
+    targets       = rec_attempt,
+    tgt_pg        = rec_attempt / games,
+    opportunities = rush_attempt + rec_attempt,
+    opp_pg        = opportunities / games
+  )
+
+# ---- 6) Position filters (driven by parameters in setup) ----
+POS_RULES <- list(
+  RB = list(stat = "opp_pg",       min = MIN_RB_OPP_PG, min_games = 2),
+  WR = list(stat = "targets",      min = MIN_WR_TGT,    min_games = 1),
+  TE = list(stat = "targets",      min = MIN_TE_TGT,    min_games = 1),
+  QB = list(stat = "pass_attempt", min = MIN_QB_DB,     min_games = 1)
+)
+
+filter_position <- function(df, pos, rules = POS_RULES, scoring = SCORING) {
+  r <- rules[[pos]]
+  if (is.null(r)) stop("No filter rule for position: ", pos)
+
+  df %>%
+    filter(position == pos,
+           games >= r$min_games,
+           .data[[r$stat]] >= r$min) %>%
+    mutate(
+      fp_pg  = .data[[paste0(scoring, "_fp_pg")]],     # active scoring
+      xfp_pg = .data[[paste0(scoring, "_xfp_pg")]],
+      foe_pg = fp_pg - xfp_pg
+    ) %>%
+    select(
+      player_id, full_name, position, posteam, teams, games, any_of("off_snaps"),
+      targets, tgt_pg, rush_attempt, opportunities, opp_pg, pass_attempt,
+      fp_pg, xfp_pg, foe_pg,
+      starts_with("ppr_"), starts_with("half_"), starts_with("std_"),
+      ends_with("_fantasy_points_exp_pg")
+    ) %>%
+    arrange(desc(xfp_pg))
+}
+
+rb_xfp       <- filter_position(player_xfp, "RB")
+receiver_xfp <- filter_position(player_xfp, "WR")
+TE_xfp       <- filter_position(player_xfp, "TE")
+qb_xfp       <- filter_position(player_xfp, "QB")
+
+filtered_all <- map_dfr(names(POS_RULES), ~ filter_position(player_xfp, .x))
+# write_csv(filtered_all, paste0("xfp_filtered_wk", Week, ".csv"))
+```
+
+```{r plot-fn}
+# ======================= CHART SETTINGS =======================
+# Text sizes
+NAME_SIZE   <- 2.3      # player names
+CORNER_SIZE <- 2.8      # quadrant labels
+
+# Logo footprint for ggrepel (it only sees a point unless told the logo size).
+# Raise if names still touch logos; scale with fig.width if you change it.
+LOGO_PT    <- 7         # xFP charts (logo width .025)
+LOGO_PT_QB <- 9.5       # QB EPA/CPOE chart (logo width .035)
+
+# Axis limits hug the data
+AXIS_PAD_X <- 0.04      # fraction of x range on each side
+LABEL_H    <- 0.075     # fraction of y range added above/below the data
+
+# Efficient / Inefficient labels (xFP charts)
+EFF_Y_PROP   <- 0.92    # Efficient label y   = 92% of max FP/G
+INEFF_Y_PROP <- 0.40    # Inefficient label y = 40% of max FP/G (floored at min)
+LABEL_W      <- 0.24    # approx. label width, fraction of x range
+LABEL_HT     <- 0.06    # approx. label height, fraction of y range
+BUF_X        <- 0.03    # clearance from logos/names, fraction of x range
+BUF_Y        <- 0.05    # clearance from logos/names, fraction of y range
+
+# HOOPERS / POOPERS (QB chart)
+CORNER_GAP <- 0.11      # space between outermost QB and corner label
+NAME_LIM   <- 0.035     # how far names may extend past the data (< CORNER_GAP)
+# ==============================================================
+
+# Player-name labels (QB chart)
+name_labels <- function(label_col, size = NAME_SIZE, box.padding = 0.3,
+                        point.padding = 0.25, point.size = LOGO_PT,
+                        ylim = c(NA, NA)) {
+  geom_text_repel(
+    aes(label = .data[[label_col]]),
+    size = size, box.padding = box.padding, point.padding = point.padding,
+    point.size = point.size, min.segment.length = 0,
+    force = 1, force_pull = 0.2, segment.alpha = 0.3, segment.size = 0.25,
+    seed = 123, max.overlaps = Inf, ylim = ylim
+  )
+}
+
+# Start at the middle of the x axis and step outward (dir = -1 left, +1 right)
+# until the label box clears every player and stays on its side of y = x.
+find_label_x <- function(xv, yv, y0, dir, xr, yr) {
+  w  <- LABEL_W * diff(xr);  h  <- LABEL_HT * diff(yr)
+  bx <- BUF_X * diff(xr);    by <- BUF_Y * diff(yr)
+  cands <- mean(xr) + dir * (w / 2 + seq(0, diff(xr), length.out = 200))
+  cands <- cands[cands >= xr[1] + w / 2 & cands <= xr[2] - w / 2]
+  for (cx in cands) {
+    clear <- !any(abs(xv - cx) < w / 2 + bx & abs(yv - y0) < h / 2 + by, na.rm = TRUE)
+    side  <- if (dir < 0) (y0 - h / 2) > (cx + w / 2) else (y0 + h / 2) < (cx - w / 2)
+    if (clear && side) return(cx)
+  }
+  if (dir < 0) xr[1] + w / 2 else xr[2] - w / 2      # fallback: edge
+}
+
+# Invisible obstacle points across a label's footprint so names stay off it
+label_obstacles <- function(cx, cy, xr, yr) {
+  w <- LABEL_W * diff(xr); h <- LABEL_HT * diff(yr)
+  expand.grid(ox = seq(cx - w / 2, cx + w / 2, length.out = 9),
+              oy = c(cy - h / 2, cy, cy + h / 2))
+}
+
+plot_xfp <- function(df, pos_label) {
+  x <- paste0(SCORING, "_xfp_pg"); y <- paste0(SCORING, "_fp_pg")
+  xr <- range(df[[x]], na.rm = TRUE); yr <- range(df[[y]], na.rm = TRUE)
+
+  eff_y   <- EFF_Y_PROP * yr[2]
+  ineff_y <- max(INEFF_Y_PROP * yr[2], yr[1] + LABEL_HT * diff(yr))
+  eff_x   <- find_label_x(df[[x]], df[[y]], eff_y,   -1, xr, yr)   # cheat left
+  ineff_x <- find_label_x(df[[x]], df[[y]], ineff_y, +1, xr, yr)   # cheat right
+
+  obs <- bind_rows(label_obstacles(eff_x,   eff_y,   xr, yr),
+                   label_obstacles(ineff_x, ineff_y, xr, yr))
+  repel_df <- bind_rows(
+    tibble(rx = df[[x]], ry = df[[y]], lab = df$full_name),
+    tibble(rx = obs$ox,  ry = obs$oy,  lab = "")            # blank = repels only
+  )
+
+  ggplot(df, aes(.data[[x]], .data[[y]])) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+    geom_nfl_logos(aes(team_abbr = posteam), width = .025) +
+    geom_text_repel(data = repel_df, aes(rx, ry, label = lab), inherit.aes = FALSE,
+                    size = NAME_SIZE, box.padding = 0.3, point.padding = 0.25,
+                    point.size = LOGO_PT, min.segment.length = 0,
+                    force = 1, force_pull = 0.2, segment.alpha = 0.3,
+                    segment.size = 0.25, seed = 123, max.overlaps = Inf) +
+    annotate("label", x = eff_x, y = eff_y,
+             label = "Efficient/Overperforming", fill = NA, color = "darkgreen",
+             fontface = "bold", size = CORNER_SIZE) +
+    annotate("label", x = ineff_x, y = ineff_y,
+             label = "Inefficient/Underperforming", fill = NA, color = "darkred",
+             fontface = "bold", size = CORNER_SIZE) +
+    coord_cartesian(xlim = c(xr[1] - AXIS_PAD_X * diff(xr), xr[2] + AXIS_PAD_X * diff(xr)),
+                    ylim = c(yr[1] - LABEL_H * diff(yr),    yr[2] + LABEL_H * diff(yr)),
+                    expand = FALSE) +
+    labs(x = paste0("Expected Fantasy Points Per Game (", scoring_label, ")"),
+         y = paste0("Fantasy Points Per Game (", scoring_label, ")"),
+         title = paste(pos_label, "xFP vs Actual Fantasy Points"),
+         subtitle = paste0(Week_Label, ", Data via ffopportunity, ", CREDIT)) +
+    theme_bw() +
+    theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 10, hjust = 0.5))
+}
+```
+
+```{r RB-xFP}
+plot_xfp(rb_xfp, "RB")
+```
+
+```{r WR-xFP}
+plot_xfp(receiver_xfp, "WR")
+```
+
+```{r TE-xFP}
+plot_xfp(TE_xfp, "TE")
+```
+
+```{r QB-xFP}
+plot_xfp(qb_xfp, "QB")
+```
+
+```{r EPA-CPOE}
+pbp <- load_pbp(SEASON)
+
+qb_epa_cpoe <- pbp %>%
+  filter(season_type == "REG",
+         game_id %in% window_games,
+         qb_dropback == 1,
+         !is.na(passer_id), !is.na(epa)) %>%       # passer_id includes scrambles
+  group_by(passer_id) %>%
+  summarise(
+    passer_player_name = last(passer),
+    team      = last(posteam),
+    dropbacks = n(),
+    epa_play  = mean(epa),
+    cpoe      = mean(cpoe, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(dropbacks >= MIN_QB_DB)
+
+xr  <- range(qb_epa_cpoe$cpoe); yr <- range(qb_epa_cpoe$epa_play)
+mx  <- mean(qb_epa_cpoe$cpoe);  my <- mean(qb_epa_cpoe$epa_play)
+gap <- 1.3 * CORNER_GAP * diff(yr)        # QB logos are larger
+nl  <- 1.3 * NAME_LIM   * diff(yr)
+
+ggplot(qb_epa_cpoe, aes(cpoe, epa_play)) +
+  geom_hline(yintercept = my, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = mx, linetype = "dashed", color = "gray60") +
+  geom_nfl_logos(aes(team_abbr = team), width = .035) +
+  name_labels("passer_player_name", box.padding = 0.5, point.padding = 0.4,
+              point.size = LOGO_PT_QB, ylim = c(yr[1] - nl, yr[2] + nl)) +
+  # top-right, just above the best QB
+  annotate("label", x = xr[2], y = yr[2] + gap, hjust = 1, vjust = 0,
+           label = "HOOPERS", fill = NA, color = "darkgreen",
+           fontface = "bold", size = CORNER_SIZE) +
+  # bottom-left, just below the worst QB
+  annotate("label", x = xr[1], y = yr[1] - gap, hjust = 0, vjust = 1,
+           label = "POOPERS", fill = NA, color = "darkred",
+           fontface = "bold", size = CORNER_SIZE) +
+  coord_cartesian(xlim = c(xr[1] - 1.3 * AXIS_PAD_X * diff(xr), xr[2] + 1.3 * AXIS_PAD_X * diff(xr)),
+                  ylim = c(yr[1] - gap - LABEL_H * diff(yr), yr[2] + gap + LABEL_H * diff(yr)),
+                  expand = FALSE) +
+  labs(x = "Completion Percentage Over Expected (CPOE)", y = "EPA per Play",
+       title = "QB EPA/Play vs CPOE",
+       subtitle = paste0(Week_Label, ", Data via nflfastR, ", CREDIT)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 22, hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(size = 13, hjust = 0.5))
+```
+
+```{r tables}
+fmt_tbl <- function(df, title, vol_col, vol_lab) {
+  df %>%
+    select(full_name, teams, games, all_of(vol_col),
+           ppr_fp_pg, ppr_xfp_pg, ppr_foe_pg,
+           half_fp_pg, half_xfp_pg, half_foe_pg,
+           std_fp_pg, std_xfp_pg, std_foe_pg,
+           any_of(c("pass_fantasy_points_exp_pg", "rush_fantasy_points_exp_pg",
+                    "rec_fantasy_points_exp_pg"))) %>%
+    arrange(desc(ppr_xfp_pg)) %>%
+    gt() %>%
+    tab_header(title = title, subtitle = Week_Label) %>%
+    tab_spanner("PPR",      starts_with("ppr_")) %>%
+    tab_spanner("Half-PPR", starts_with("half_")) %>%
+    tab_spanner("Standard", starts_with("std_")) %>%
+    tab_spanner("xFP by source / G", ends_with("_exp_pg")) %>%
+    cols_label(.list = c(
+      list(full_name = "Player", teams = "Team", games = "G",
+           ppr_fp_pg = "FP/G",  ppr_xfp_pg = "xFP/G",  ppr_foe_pg = "+/-",
+           half_fp_pg = "FP/G", half_xfp_pg = "xFP/G", half_foe_pg = "+/-",
+           std_fp_pg = "FP/G",  std_xfp_pg = "xFP/G",  std_foe_pg = "+/-",
+           pass_fantasy_points_exp_pg = "Pass", rush_fantasy_points_exp_pg = "Rush",
+           rec_fantasy_points_exp_pg = "Rec"),
+      setNames(list(vol_lab), vol_col)
+    )) %>%
+    fmt_number(where(is.double), decimals = 1) %>%
+    data_color(columns = ends_with("foe_pg"),
+               fn = scales::col_numeric(c("#b2182b", "white", "#1b7837"), domain = NULL)) %>%
+    opt_interactive(use_search = TRUE, use_pagination = FALSE)
+}
+
+fmt_tbl(rb_xfp,       "RB Fantasy Points vs Expected", "opportunities", "Opps")
+fmt_tbl(receiver_xfp, "WR Fantasy Points vs Expected", "targets",       "Tgt")
+fmt_tbl(TE_xfp,       "TE Fantasy Points vs Expected", "targets",       "Tgt")
+fmt_tbl(qb_xfp,       "QB Fantasy Points vs Expected", "pass_attempt",  "Att")
+```
+
+```{r diagnostics}
+# Data-completeness checks - read before publishing
+diag <- list(
+  ffopp_latest_week = max(ep_raw$week, na.rm = TRUE),
+  requested_week    = Week,
+  teams_with_bye    = team_window %>% count(team) %>% filter(n < N_WEEKS),
+  missing_position  = sum(is.na(player_xfp$position)),
+  traded_players    = player_xfp %>% filter(str_detect(teams, "/")) %>% select(full_name, teams),
+  zero_touch_games  = player_xfp %>% filter(coalesce(snap_games, 0L) > ep_games) %>%
+                        select(full_name, position, ep_games, snap_games),
+  no_snap_match     = player_xfp %>% filter(is.na(snap_games), ep_games > 0) %>%
+                        select(full_name, position, ep_games),
+  players_per_pos   = filtered_all %>% count(position)
+)
+
+if (diag$ffopp_latest_week < Week)
+  warning(sprintf("ffopportunity only has data through Week %d (requested %d).",
+                  diag$ffopp_latest_week, Week))
+diag
+
+# Validation: ffopportunity actual PPR vs nflverse PPR (should be ~0 diff).
+# Large differences mean the half-PPR / standard conversions are off.
+check <- tryCatch(
+  load_player_stats(SEASON) %>%
+    filter(season_type == "REG") %>%
+    select(player_id, week, nflverse_ppr = fantasy_points_ppr) %>%
+    inner_join(ep %>% select(player_id, full_name, week, total_fantasy_points),
+               by = c("player_id", "week")) %>%
+    mutate(diff = round(total_fantasy_points - nflverse_ppr, 2)) %>%
+    filter(abs(diff) > 0.5) %>%
+    arrange(desc(abs(diff))),
+  error = function(e) NULL)
+check
+```
