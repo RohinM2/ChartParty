@@ -1,0 +1,253 @@
+---
+title: "In-Week Fantasy Outliers vs. Home/Away, Game Totals & Spreads"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6.5, dpi = 200)
+
+library(tidyverse)
+library(nflreadr)
+library(gt)
+
+# ======================= PARAMETERS =======================
+SEASONS  <- 2020:get_current_season()   # more seasons = more stable rates
+THRU_WK  <- 10                          # last week of the current season to include
+SCORING  <- "fantasy_points_ppr"        # or "fantasy_points" (standard)
+Z_CUT    <- 2                           # outlier = z-score >= this within week & position
+TOP_N    <- 3                           # also flag top-N finishers at position each week
+
+# Volume floor: defines the "fantasy-relevant" pool each week (keeps z-scores honest)
+MIN_VOL  <- list(QB = 15, RB = 5, WR = 3, TE = 3)   # QB att | RB car+tgt | WR/TE tgt
+
+CREDIT   <- "@rohinmishra / rohinm.substack.com"
+# ==========================================================
+```
+
+```{r data}
+# ---- Schedules: home/away, total, spread from each team's perspective ----
+sched <- load_schedules(SEASONS) %>%
+  filter(game_type == "REG", !is.na(result),
+         season < max(SEASONS) | week <= THRU_WK) %>%
+  rename(site = location) %>%                       # "Home" / "Neutral"
+  select(game_id, season, week, site, home_team, away_team,
+         home_score, away_score, total_line, spread_line, total, result)
+
+team_lines <- clean_homeaway(sched) %>%
+  transmute(
+    game_id, season, week, team, opponent,
+    venue      = case_when(site == "Neutral" ~ "Neutral",
+                           location == "home" ~ "Home", TRUE ~ "Away"),
+    total_line,
+    # nflverse spread_line = expected HOME margin; flip for away teams
+    team_spread = if_else(location == "home", spread_line, -spread_line),  # + = favored
+    implied_tt  = total_line / 2 + team_spread / 2,
+    team_score, opponent_score,
+    game_total  = team_score + opponent_score
+  )
+
+# ---- Weekly player stats ----
+ps <- load_player_stats(SEASONS, summary_level = "week") %>%
+  filter(season_type == "REG", position %in% c("QB", "RB", "WR", "TE")) %>%
+  mutate(
+    fp  = .data[[SCORING]],
+    vol = case_when(position == "QB" ~ attempts,
+                    position == "RB" ~ carries + targets,
+                    TRUE             ~ targets)
+  ) %>%
+  filter(vol >= unlist(MIN_VOL)[position])
+
+# ---- Outlier flags: relative to that week's field at the same position ----
+df <- ps %>%
+  inner_join(team_lines, by = c("season", "week", "team")) %>%
+  group_by(season, week, position) %>%
+  mutate(
+    z        = (fp - mean(fp)) / sd(fp),
+    pos_rank = min_rank(desc(fp)),
+    outlier  = z >= Z_CUT,
+    top_n    = pos_rank <= TOP_N
+  ) %>%
+  ungroup() %>%
+  mutate(
+    position    = factor(position, levels = c("QB", "RB", "WR", "TE")),
+    total_bin   = cut(total_line, c(-Inf, 40.5, 43.5, 46.5, 49.5, Inf),
+                      labels = c("<=40.5", "41-43.5", "44-46.5", "47-49.5", "50+")),
+    spread_bin  = cut(team_spread, c(-Inf, -7.5, -3.5, -0.5, 0.5, 3.5, 7.5, Inf),
+                      labels = c("Dog 8+", "Dog 4-7.5", "Dog 1-3.5", "PK",
+                                 "Fav 1-3.5", "Fav 4-7.5", "Fav 8+")),
+    itt_bin     = cut(implied_tt, c(-Inf, 19, 21.5, 24, 26.5, Inf),
+                      labels = c("<19", "19-21.5", "21.5-24", "24-26.5", "26.5+"))
+  )
+
+Data_Label <- sprintf("%d-%d REG (thru %d Wk %d) | outlier = z >= %.1f vs. week/position field",
+                      min(SEASONS), max(SEASONS), max(SEASONS), THRU_WK, Z_CUT)
+```
+
+```{r helpers}
+# Outlier rate with 95% Wilson CI + lift vs. that position's baseline rate
+rate_by <- function(data, var, flag = "outlier") {
+  base <- data %>% group_by(position) %>% summarise(base = mean(.data[[flag]]), .groups = "drop")
+  data %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(position, level = .data[[var]]) %>%
+    summarise(n = n(), hits = sum(.data[[flag]]), .groups = "drop") %>%
+    mutate(
+      rate = hits / n,
+      z95  = 1.96,
+      lo   = (rate + z95^2/(2*n) - z95*sqrt(rate*(1-rate)/n + z95^2/(4*n^2))) / (1 + z95^2/n),
+      hi   = (rate + z95^2/(2*n) + z95*sqrt(rate*(1-rate)/n + z95^2/(4*n^2))) / (1 + z95^2/n)
+    ) %>%
+    left_join(base, by = "position") %>%
+    mutate(lift = rate / base)
+}
+
+plot_rate <- function(r, xlab, title) {
+  ggplot(r, aes(level, rate, fill = position)) +
+    geom_col(width = 0.7, alpha = 0.9) +
+    geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.2, colour = "grey30") +
+    geom_hline(aes(yintercept = base), linetype = "dashed", colour = "grey40") +
+    geom_text(aes(label = paste0("n=", n)), y = 0, vjust = -0.4, size = 2.4, colour = "white") +
+    facet_wrap(~ position, nrow = 1) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    scale_fill_manual(values = c(QB = "#d7301f", RB = "#2171b5", WR = "#238b45", TE = "#6a51a3"),
+                      guide = "none") +
+    labs(x = xlab, y = "Outlier rate", title = title,
+         subtitle = paste0(Data_Label, " | dashed = position baseline"),
+         caption = paste("Data: nflreadr |", CREDIT)) +
+    theme_bw() +
+    theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 9, hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+}
+```
+
+## Home vs. Away
+
+```{r home-away}
+r_ha <- rate_by(filter(df, venue != "Neutral"), "venue")
+plot_rate(r_ha, NULL, "Outlier Rate: Home vs. Away")
+```
+
+## Game Total (Vegas)
+
+```{r totals}
+r_tot <- rate_by(df, "total_bin")
+plot_rate(r_tot, "Closing game total", "Outlier Rate by Vegas Game Total")
+```
+
+## Spread (team perspective)
+
+```{r spreads}
+r_spr <- rate_by(df, "spread_bin")
+plot_rate(r_spr, "Team spread", "Outlier Rate by Point Spread")
+```
+
+## Implied Team Total (total + spread combined)
+
+```{r itt}
+r_itt <- rate_by(df, "itt_bin")
+plot_rate(r_itt, "Implied team total", "Outlier Rate by Implied Team Total")
+```
+
+## Total x Spread Heatmap
+
+```{r heatmap, fig.height=8}
+heat <- df %>%
+  filter(!is.na(total_bin), !is.na(spread_bin)) %>%
+  group_by(position, total_bin, spread_bin) %>%
+  summarise(n = n(), rate = mean(outlier), .groups = "drop") %>%
+  filter(n >= 30)                                   # hide thin cells
+
+ggplot(heat, aes(spread_bin, total_bin, fill = rate)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.0f%%\n(n=%d)", 100 * rate, n)), size = 2.2) +
+  facet_wrap(~ position, ncol = 2) +
+  scale_fill_gradient(low = "white", high = "#1b7837", labels = scales::percent) +
+  labs(x = "Team spread", y = "Game total", fill = "Outlier rate",
+       title = "Outlier Rate by Game Total x Spread",
+       subtitle = paste0(Data_Label, " | cells with n < 30 hidden"),
+       caption = paste("Data: nflreadr |", CREDIT)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 9, hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+## Did the game actually shoot out? (Vegas vs. reality)
+
+```{r actual-vs-line}
+# Outliers vs. how far the real game total beat the closing line
+df %>%
+  mutate(total_miss = cut(game_total - total_line, c(-Inf, -10, -3, 3, 10, Inf),
+                          labels = c("Under 10+", "Under 3-10", "Within 3",
+                                     "Over 3-10", "Over 10+"))) %>%
+  rate_by("total_miss") %>%
+  plot_rate("Actual game total vs. closing line", "Outlier Rate by Game Script vs. Vegas")
+```
+
+## Model: independent effect of each factor
+
+```{r model}
+# Logistic regression per position: home + total + spread together
+fit_pos <- function(d) {
+  m <- glm(outlier ~ I(venue == "Home") + total_line + team_spread,
+           data = filter(d, venue != "Neutral"), family = binomial)
+  ci <- suppressMessages(confint.default(m))
+  tibble(term = c("Home (vs away)", "Game total (+1 pt)", "Spread (+1 pt favored)"),
+         odds_ratio = exp(coef(m))[-1],
+         lo = exp(ci[-1, 1]), hi = exp(ci[-1, 2]),
+         p  = summary(m)$coefficients[-1, 4])
+}
+
+models <- df %>% group_by(position) %>% group_modify(~ fit_pos(.x)) %>% ungroup()
+
+models %>%
+  gt(groupname_col = "position") %>%
+  tab_header(title = "Outlier odds ratios (logistic regression)",
+             subtitle = "OR > 1 = more likely to post an in-week outlier") %>%
+  cols_label(term = "", odds_ratio = "OR", lo = "95% lo", hi = "95% hi", p = "p-value") %>%
+  fmt_number(c(odds_ratio, lo, hi), decimals = 3) %>%
+  fmt_number(p, decimals = 3) %>%
+  data_color(columns = odds_ratio,
+             fn = scales::col_numeric(c("#b2182b", "white", "#1b7837"), domain = NULL))
+```
+
+## Summary table
+
+```{r summary-table}
+bind_rows(
+  r_ha  %>% mutate(factor = "Venue"),
+  r_tot %>% mutate(factor = "Game total"),
+  r_spr %>% mutate(factor = "Spread"),
+  r_itt %>% mutate(factor = "Implied team total")
+) %>%
+  transmute(factor, position, level = as.character(level), n, hits,
+            rate, lift) %>%
+  pivot_wider(id_cols = c(factor, level), names_from = position,
+              values_from = c(rate, lift, n), names_glue = "{position}_{.value}") %>%
+  select(factor, level, starts_with("QB"), starts_with("RB"),
+         starts_with("WR"), starts_with("TE")) %>%
+  gt(groupname_col = "factor") %>%
+  tab_header(title = "Outlier rate & lift by game environment", subtitle = Data_Label) %>%
+  fmt_percent(ends_with("_rate"), decimals = 1) %>%
+  fmt_number(ends_with("_lift"), decimals = 2) %>%
+  data_color(columns = ends_with("_lift"),
+             fn = scales::col_numeric(c("#b2182b", "white", "#1b7837"), domain = c(0, 2)))
+```
+
+## Biggest outliers in the current season
+
+```{r current-outliers}
+df %>%
+  filter(season == max(SEASONS), outlier) %>%
+  arrange(desc(z)) %>%
+  transmute(Wk = week, Player = player_display_name, Pos = position, Team = team,
+            Opp = opponent, Venue = venue, Total = total_line,
+            Spread = team_spread, ITT = round(implied_tt, 1),
+            FP = round(fp, 1), z = round(z, 2), Rank = pos_rank) %>%
+  head(40) %>%
+  gt() %>%
+  tab_header(title = sprintf("%d in-week outliers (z >= %.1f)", max(SEASONS), Z_CUT))
+```
