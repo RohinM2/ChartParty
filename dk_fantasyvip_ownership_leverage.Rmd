@@ -1,0 +1,599 @@
+---
+title: "DraftKings Main Slate (fantasy.VIP): When Do Skill Players Hit 3x / 4x / 5x?"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6.5, dpi = 200)
+
+pkgs <- c("tidyverse", "nflreadr", "rvest", "chromote", "jsonlite", "gt", "scales")
+new  <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(new)) install.packages(new)
+
+library(tidyverse)
+library(nflreadr)
+library(rvest)
+library(chromote)
+library(jsonlite)
+library(gt)
+
+# ======================= PARAMETERS =======================
+VIP_URL    <- "https://fantasy.vip/nfl/dfs/milly-maker-almanac"
+SEASON     <- 2026
+CACHE_FILE <- "fantasyvip_player_data.rds"   # delete to force a fresh pull
+
+# Optional manual fallback: if the site offers a CSV export on the
+# "Player Data" tab, save it here and it will be used instead of scraping.
+MANUAL_CSV <- "fantasyvip_player_data.csv"
+
+POSITIONS  <- c("RB", "WR", "TE")
+MIN_SAMPLE <- 40
+CREDIT     <- "@rohinmishra / rohinm.substack.com"
+# ==========================================================
+```
+
+```{r fantasyvip-scraper}
+# The Milly Maker Almanac is built from the DraftKings Milly Maker, which is
+# always the Sunday MAIN slate - so non-main-slate players are excluded by design.
+#
+# The page is JavaScript-rendered. This chunk opens it in headless Chrome,
+# listens to the network traffic for the JSON the page loads, clicks the
+# "Player Data" tab, and keeps any JSON payload that looks like player-week rows
+# (has salary + points). If no JSON is captured, it falls back to reading the
+# rendered table.
+
+find_player_rows <- function(x) {
+  # Recursively search a parsed JSON object for a data frame with salary + points
+  if (is.data.frame(x)) {
+    nm <- tolower(names(x))
+    if (any(str_detect(nm, "salary")) && any(str_detect(nm, "point|fpts|score|dk"))) return(list(x))
+    return(flatten(map(x, find_player_rows)))
+  }
+  if (is.list(x)) return(flatten(map(x, find_player_rows)))
+  list()
+}
+
+scrape_fantasyvip <- function(url) {
+  b <- ChromoteSession$new()
+  on.exit(b$close(), add = TRUE)
+
+  captured <- list()
+  b$Network$enable()
+  b$Network$responseReceived(callback = function(msg) {
+    if (str_detect(msg$response$mimeType %||% "", "json")) {
+      body <- tryCatch(b$Network$getResponseBody(requestId = msg$requestId),
+                       error = function(e) NULL)
+      if (!is.null(body$body)) captured[[length(captured) + 1]] <<- body$body
+    }
+  }, wait_ = FALSE)
+
+  b$Page$navigate(url); b$Page$loadEventFired(); Sys.sleep(4)
+
+  # Make sure the full season is selected, then open the Player Data tab
+  b$Runtime$evaluate("
+    const clickText = t => { const el = [...document.querySelectorAll('button,a,[role=tab],li,span')]
+      .find(e => e.textContent.trim() === t); if (el) el.click(); };
+    clickText('Full Season'); clickText('Player Data');")
+  Sys.sleep(5)
+
+  # Scroll / expand to trigger any lazy loading
+  b$Runtime$evaluate("window.scrollTo(0, document.body.scrollHeight);")
+  Sys.sleep(3)
+
+  # 1) Prefer captured JSON
+  rows <- captured %>%
+    map(~ tryCatch(fromJSON(.x, flatten = TRUE), error = function(e) NULL)) %>%
+    compact() %>%
+    map(find_player_rows) %>%
+    flatten()
+
+  if (length(rows)) {
+    out <- rows[[which.max(map_int(rows, nrow))]] %>% as_tibble()
+    attr(out, "source") <- "json"
+    return(out)
+  }
+
+  # 2) Fallback: rendered HTML table(s)
+  html <- b$Runtime$evaluate("document.documentElement.outerHTML")$result$value
+  tbls <- read_html(html) %>% html_elements("table") %>% html_table(fill = TRUE)
+  tbls <- keep(tbls, ~ any(str_detect(tolower(names(.x)), "salary")))
+  if (!length(tbls)) stop("No player table or JSON found - see notes in the report.")
+  out <- bind_rows(tbls) %>% as_tibble()
+  attr(out, "source") <- "html"
+  out
+}
+
+raw <- if (file.exists(MANUAL_CSV)) {
+  read_csv(MANUAL_CSV, show_col_types = FALSE)
+} else if (file.exists(CACHE_FILE)) {
+  readRDS(CACHE_FILE)
+} else {
+  r <- scrape_fantasyvip(VIP_URL); saveRDS(r, CACHE_FILE); r
+}
+
+# Peek at what came back so column mapping can be checked
+glimpse(raw)
+```
+
+```{r standardize}
+# Map whatever column names the site uses onto a standard set.
+pick <- function(df, patterns) {
+  nm <- names(df)
+  hit <- nm[str_detect(tolower(nm), regex(patterns, ignore_case = TRUE))]
+  if (length(hit)) df[[hit[1]]] else NA
+}
+
+vip <- tibble(
+  name      = pick(raw, "^(player|name|player_?name|full_?name|display)"),
+  position  = pick(raw, "^(pos|position)"),
+  team      = pick(raw, "^(team|tm|team_?abbr)"),
+  week      = pick(raw, "^(week|wk)$"),
+  salary    = pick(raw, "salary"),
+  dk_points = pick(raw, "^(dk_?)?(points|pts|fpts|score|fantasy_?points)$"),
+  own       = pick(raw, "own")
+) %>%
+  mutate(
+    season    = SEASON,
+    week      = as.integer(parse_number(as.character(week))),
+    salary    = parse_number(as.character(salary)),
+    salary    = if_else(salary < 100, salary * 1000, salary),   # "$6.3k" -> 6300
+    dk_points = parse_number(as.character(dk_points)),
+    own       = parse_number(as.character(own)),
+    position  = str_to_upper(position),
+    team      = recode(team, JAC = "JAX", LA = "LAR", WSH = "WAS")
+  ) %>%
+  filter(!is.na(salary), !is.na(week))
+
+# Stop early if the mapping missed something important
+missing_cols <- names(which(colSums(!is.na(vip[c("name", "position", "team", "week",
+                                                  "salary", "dk_points")])) == 0))
+if (length(missing_cols))
+  stop("Could not map: ", paste(missing_cols, collapse = ", "),
+       " - check glimpse(raw) and adjust the patterns in pick().")
+
+vip %>% count(week, name = "players_on_main_slate")
+```
+
+```{r stats-lines}
+# fantasy.VIP points are actual DraftKings points (bonuses included).
+# nflverse yardage is used only to measure how many hits needed a +3 bonus.
+ids <- load_rosters_weekly(SEASON) %>%
+  filter(game_type == "REG") %>%
+  transmute(week, team, gsis_id,
+            merge_name = clean_player_names(full_name, lowercase = TRUE)) %>%
+  distinct(week, team, merge_name, .keep_all = TRUE)
+
+bon <- load_player_stats(SEASON, summary_level = "week") %>%
+  filter(season_type == "REG") %>%
+  transmute(week, gsis_id = player_id,
+            bonus = 3 * (coalesce(rushing_yards, 0) >= 100) +
+                    3 * (coalesce(receiving_yards, 0) >= 100))
+
+lines <- load_schedules(SEASON) %>%
+  filter(game_type == "REG") %>%
+  clean_homeaway() %>%
+  transmute(week, team, opponent,
+            venue       = if_else(location == "home", "Home", "Away"),
+            total_line,
+            team_spread = if_else(location == "home", spread_line, -spread_line),  # + = favored
+            implied_tt  = total_line / 2 + team_spread / 2)
+
+df <- vip %>%
+  filter(position %in% POSITIONS) %>%
+  mutate(merge_name = clean_player_names(name, lowercase = TRUE)) %>%
+  left_join(ids,   by = c("week", "team", "merge_name")) %>%
+  left_join(bon,   by = c("week", "gsis_id")) %>%
+  left_join(lines, by = c("week", "team")) %>%
+  mutate(
+    dk_points = replace_na(dk_points, 0),          # priced but didn't play = 0
+    bonus     = replace_na(bonus, 0),
+    multiple  = dk_points / (salary / 1000),
+    hit3 = multiple >= 3, hit4 = multiple >= 4, hit5 = multiple >= 5,
+    hit3_nobonus = (dk_points - bonus) / (salary / 1000) >= 3,
+    hit4_nobonus = (dk_points - bonus) / (salary / 1000) >= 4,
+    hit5_nobonus = (dk_points - bonus) / (salary / 1000) >= 5,
+    position   = factor(position, levels = POSITIONS),
+    sal_tier   = cut(salary, c(0, 3999, 4999, 5999, 6999, 7999, Inf),
+                     labels = c("<$4K", "$4-4.9K", "$5-5.9K", "$6-6.9K", "$7-7.9K", "$8K+")),
+    total_bin  = cut(total_line, c(-Inf, 40.5, 43.5, 46.5, 49.5, Inf),
+                     labels = c("<=40.5", "41-43.5", "44-46.5", "47-49.5", "50+")),
+    spread_bin = cut(team_spread, c(-Inf, -7.5, -3.5, -0.5, 0.5, 3.5, 7.5, Inf),
+                     labels = c("Dog 8+", "Dog 4-7.5", "Dog 1-3.5", "PK",
+                                "Fav 1-3.5", "Fav 4-7.5", "Fav 8+")),
+    itt_bin    = cut(implied_tt, c(-Inf, 19, 21.5, 24, 26.5, Inf),
+                     labels = c("<19", "19-21.5", "21.5-24", "24-26.5", "26.5+"))
+  )
+
+Data_Label <- sprintf("DK Milly Maker (main slate) via fantasy.VIP, %d Wks 1-%d | RB/WR/TE | DK scoring incl. bonuses",
+                      SEASON, max(df$week))
+```
+
+```{r diagnostics}
+list(
+  weeks              = sort(unique(df$week)),
+  rows_by_position   = df %>% count(position),
+  no_vegas_lines     = df %>% filter(is.na(total_line)) %>% count(week, team),
+  unmatched_for_bonus = df %>% filter(is.na(gsis_id)) %>%
+                          select(week, name, team, salary) %>% arrange(desc(salary)) %>% head(25)
+)
+```
+
+> Unmatched players still count in every hit-rate (salary and DK points come straight from fantasy.VIP); they only lose the "needed a bonus" breakdown.
+
+```{r helpers}
+wilson <- function(h, n) {
+  p <- h / n; z <- 1.96
+  tibble(lo = (p + z^2/(2*n) - z*sqrt(p*(1-p)/n + z^2/(4*n^2))) / (1 + z^2/n),
+         hi = (p + z^2/(2*n) + z*sqrt(p*(1-p)/n + z^2/(4*n^2))) / (1 + z^2/n))
+}
+
+hit_rates <- function(data, var) {
+  data %>%
+    filter(!is.na(.data[[var]])) %>%
+    pivot_longer(c(hit3, hit4, hit5), names_to = "target", values_to = "hit") %>%
+    mutate(target = recode(target, hit3 = "3x", hit4 = "4x", hit5 = "5x")) %>%
+    group_by(position, target, level = .data[[var]]) %>%
+    summarise(n = n(), hits = sum(hit), .groups = "drop") %>%
+    mutate(rate = hits / n, bind_cols(wilson(hits, n))) %>%
+    group_by(position, target) %>%
+    mutate(base = sum(hits) / sum(n), lift = rate / base) %>%
+    ungroup() %>%
+    filter(n >= MIN_SAMPLE)
+}
+
+plot_hits <- function(r, xlab, title) {
+  ggplot(r, aes(level, rate, colour = target, group = target)) +
+    geom_hline(aes(yintercept = base, colour = target), linetype = "dashed", alpha = 0.5) +
+    geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(0.5), size = 0.3) +
+    geom_line(position = position_dodge(0.5), alpha = 0.5) +
+    facet_wrap(~ position, nrow = 1) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    scale_colour_manual(values = c("3x" = "#2171b5", "4x" = "#238b45", "5x" = "#d7301f")) +
+    labs(x = xlab, y = "Hit rate", colour = NULL, title = title,
+         subtitle = paste0(Data_Label, "\ndashed = position baseline | 95% CI"),
+         caption = paste("Data: fantasy.VIP, nflreadr |", CREDIT)) +
+    theme_bw() +
+    theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 8.5, hjust = 0.5),
+          legend.position = "top",
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+}
+```
+
+## Baseline
+
+```{r baseline}
+df %>%
+  group_by(position) %>%
+  summarise(players = n(), `3x` = mean(hit3), `4x` = mean(hit4), `5x` = mean(hit5),
+            `5x w/o bonus` = mean(hit5_nobonus), `Bonus games` = mean(bonus > 0),
+            .groups = "drop") %>%
+  gt() %>%
+  tab_header("Main-slate hit rates by position", Data_Label) %>%
+  fmt_percent(-c(position, players), decimals = 1)
+```
+
+## Salary tier
+
+```{r salary}
+plot_hits(hit_rates(df, "sal_tier"), "DK salary", "Hit Rate by Salary Tier")
+```
+
+## Home vs. Away
+
+```{r venue}
+plot_hits(hit_rates(df, "venue"), NULL, "Hit Rate: Home vs. Away")
+```
+
+## Game total
+
+```{r total}
+plot_hits(hit_rates(df, "total_bin"), "Closing game total", "Hit Rate by Vegas Game Total")
+```
+
+## Spread
+
+```{r spread}
+plot_hits(hit_rates(df, "spread_bin"), "Team spread", "Hit Rate by Point Spread")
+```
+
+## Implied team total
+
+```{r itt}
+plot_hits(hit_rates(df, "itt_bin"), "Implied team total", "Hit Rate by Implied Team Total")
+```
+
+## DK bonus impact
+
+```{r bonus}
+df %>%
+  group_by(position) %>%
+  summarise(
+    `3x` = mean(hit3), `3x no bonus` = mean(hit3_nobonus),
+    `4x` = mean(hit4), `4x no bonus` = mean(hit4_nobonus),
+    `5x` = mean(hit5), `5x no bonus` = mean(hit5_nobonus),
+    `Share of 5x that needed bonus` = sum(hit5 & !hit5_nobonus) / pmax(sum(hit5), 1),
+    .groups = "drop") %>%
+  gt() %>%
+  tab_header("Effect of +3 yardage bonuses (100 rush / 100 rec yds)", Data_Label) %>%
+  fmt_percent(-position, decimals = 1)
+```
+
+## Independent effects (salary held constant)
+
+```{r model}
+fit_one <- function(d, outcome) {
+  d <- filter(d, !is.na(total_line))
+  m <- glm(reformulate(c("I(salary/1000)", "I(venue == 'Home')", "total_line", "team_spread"),
+                       response = outcome), data = d, family = binomial)
+  ci <- suppressMessages(confint.default(m))
+  tibble(term = c("Salary (+$1K)", "Home (vs away)", "Game total (+1 pt)", "Spread (+1 pt favored)"),
+         odds_ratio = exp(coef(m))[-1], lo = exp(ci[-1, 1]), hi = exp(ci[-1, 2]),
+         p = summary(m)$coefficients[-1, 4])
+}
+
+expand_grid(position = POSITIONS, target = c("hit3", "hit4", "hit5")) %>%
+  mutate(res = map2(position, target,
+                    possibly(~ fit_one(filter(df, position == .x), .y), otherwise = NULL))) %>%
+  unnest(res) %>%
+  mutate(target = recode(target, hit3 = "3x", hit4 = "4x", hit5 = "5x")) %>%
+  ggplot(aes(odds_ratio, fct_rev(term), colour = target)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(0.6), size = 0.3) +
+  facet_wrap(~ position, nrow = 1) +
+  scale_x_log10() +
+  scale_colour_manual(values = c("3x" = "#2171b5", "4x" = "#238b45", "5x" = "#d7301f")) +
+  labs(x = "Odds ratio (log scale; > 1 = more likely to hit)", y = NULL, colour = NULL,
+       title = "Independent Effect of Each Condition", subtitle = Data_Label,
+       caption = paste("Data: fantasy.VIP, nflreadr |", CREDIT)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 8.5, hjust = 0.5), legend.position = "top")
+```
+
+## Most favorable conditions
+
+```{r ranked}
+bind_rows(
+  hit_rates(df, "venue")      %>% mutate(factor = "Venue"),
+  hit_rates(df, "total_bin")  %>% mutate(factor = "Game total"),
+  hit_rates(df, "spread_bin") %>% mutate(factor = "Spread"),
+  hit_rates(df, "itt_bin")    %>% mutate(factor = "Implied team total"),
+  hit_rates(df, "sal_tier")   %>% mutate(factor = "Salary")
+) %>%
+  group_by(position, target) %>%
+  slice_max(lift, n = 5) %>%
+  ungroup() %>%
+  transmute(position, target, factor, level = as.character(level), n, rate, base, lift) %>%
+  gt(groupname_col = c("position", "target")) %>%
+  tab_header("Top 5 conditions by lift over baseline", paste0(Data_Label, " | min n = ", MIN_SAMPLE)) %>%
+  fmt_percent(c(rate, base), decimals = 1) %>%
+  fmt_number(lift, decimals = 2)
+```
+
+## Every 5x this season
+
+```{r fivex}
+df %>%
+  filter(hit5) %>%
+  arrange(desc(multiple)) %>%
+  transmute(Wk = week, Player = name, Pos = position, Team = team, Venue = venue,
+            Salary = salary, `DK Pts` = dk_points, Mult = round(multiple, 2),
+            Bonus = bonus, Total = total_line, Spread = team_spread,
+            ITT = round(implied_tt, 1)) %>%
+  gt() %>%
+  tab_header("5x salary performances", Data_Label) %>%
+  fmt_currency(Salary, decimals = 0)
+```
+
+# Ownership & Leverage
+
+```{r own-prep}
+# Ownership from fantasy.VIP = actual Milly Maker field ownership (%).
+# Leverage framework:
+#   implied_rate = how often the field "expects" a hit (ownership share within position-week)
+#   own_share    = player's ownership / sum of ownership at his position that week
+#   hit_share    = player's share of that week's 5x hits at his position
+#   leverage     = actual hit rate - field-implied rate (by bucket)
+own_df <- df %>%
+  filter(!is.na(own)) %>%
+  mutate(
+    own = if_else(max(own, na.rm = TRUE) <= 1, own * 100, own),   # normalise to %
+    own_tier = cut(own, c(-Inf, 2, 5, 10, 20, 30, Inf),
+                   labels = c("<2%", "2-5%", "5-10%", "10-20%", "20-30%", "30%+"))
+  ) %>%
+  group_by(week, position) %>%
+  mutate(
+    own_share  = own / sum(own),
+    own_rank   = min_rank(desc(own)),
+    hits5_wk   = sum(hit5),
+    hit_share5 = if_else(hits5_wk > 0, hit5 / hits5_wk, NA_real_)
+  ) %>%
+  ungroup()
+
+stopifnot("No ownership column mapped - check pick(raw, 'own')" = nrow(own_df) > 0)
+```
+
+## Hit rate vs. ownership tier
+
+```{r own-tier}
+r_own <- hit_rates(own_df, "own_tier")
+plot_hits(r_own, "Milly Maker ownership", "Hit Rate by Ownership Tier")
+```
+
+> If low-owned tiers hit at rates close to the chalk tiers, the field is over-concentrating on a few players.
+
+## Does ownership track hit probability? (calibration)
+
+```{r calibration}
+# Model each player's 5x probability from salary + Vegas (no ownership), then
+# compare to how the field actually owned them. Players the model likes but the
+# field doesn't = structural leverage.
+m5 <- glm(hit5 ~ position * (I(salary/1000) + total_line + team_spread) + venue,
+          data = filter(own_df, !is.na(total_line)), family = binomial)
+
+own_df <- own_df %>%
+  mutate(p5 = predict(m5, newdata = own_df, type = "response")) %>%
+  group_by(week, position) %>%
+  mutate(p5_share = p5 / sum(p5, na.rm = TRUE),          # model's share of expected 5x hits
+         lev_score = p5_share - own_share) %>%             # + = underowned vs. hit odds
+  ungroup()
+
+own_df %>%
+  filter(!is.na(p5)) %>%
+  mutate(p5_bin = cut(p5, quantile(p5, 0:10/10, na.rm = TRUE), include.lowest = TRUE)) %>%
+  group_by(position, p5_bin) %>%
+  summarise(model_p5 = mean(p5), actual_5x = mean(hit5), avg_own = mean(own),
+            n = n(), .groups = "drop") %>%
+  ggplot(aes(model_p5, avg_own)) +
+  geom_point(aes(size = n, colour = actual_5x)) +
+  geom_smooth(method = "lm", se = FALSE, colour = "grey50", linewidth = 0.5) +
+  facet_wrap(~ position, nrow = 1, scales = "free_x") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_colour_gradient(low = "grey80", high = "#d7301f", labels = scales::percent) +
+  labs(x = "Model 5x probability (salary + Vegas)", y = "Avg Milly Maker ownership (%)",
+       colour = "Actual 5x rate", size = "n",
+       title = "Field Ownership vs. Pre-Game 5x Probability",
+       subtitle = paste0(Data_Label, "\nflat slope = field under-reacts to hit odds; steep = over-reacts"),
+       caption = paste("Data: fantasy.VIP, nflreadr |", CREDIT)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 8.5, hjust = 0.5))
+```
+
+> The model is fit and evaluated on the same 10 weeks, so treat it as descriptive, not predictive.
+
+## Where is the field leaving 5x on the table?
+
+```{r leverage-conditions}
+# For each condition: share of all 5x hits it produced vs. share of ownership it got.
+lev_by <- function(var, label) {
+  own_df %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(position, level = .data[[var]]) %>%
+    summarise(n = n(), hits5 = sum(hit5), own_sum = sum(own), .groups = "drop") %>%
+    group_by(position) %>%
+    mutate(hit_share = hits5 / sum(hits5),
+           own_share = own_sum / sum(own_sum),
+           leverage  = hit_share - own_share,          # + = field underweights
+           lev_ratio = hit_share / own_share) %>%
+    ungroup() %>%
+    mutate(factor = label)
+}
+
+lev_all <- bind_rows(
+  lev_by("venue", "Venue"), lev_by("total_bin", "Game total"),
+  lev_by("spread_bin", "Spread"), lev_by("itt_bin", "Implied team total"),
+  lev_by("sal_tier", "Salary"), lev_by("own_tier", "Ownership tier")
+) %>% filter(n >= MIN_SAMPLE / 2)
+
+ggplot(lev_all, aes(leverage, fct_reorder(paste(factor, level, sep = ": "), leverage),
+                    fill = leverage > 0)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  facet_wrap(~ position, nrow = 1) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c(`TRUE` = "#1b7837", `FALSE` = "#b2182b"), guide = "none") +
+  labs(x = "Share of 5x hits minus share of ownership", y = NULL,
+       title = "Leverage by Game Condition",
+       subtitle = paste0(Data_Label, "\ngreen = produced more 5x hits than the field owned it for"),
+       caption = paste("Data: fantasy.VIP, nflreadr |", CREDIT)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 8.5, hjust = 0.5),
+        axis.text.y = element_text(size = 7))
+```
+
+## Ownership-weighted points vs. actual (where the field's exposure went)
+
+```{r field-exposure}
+own_df %>%
+  group_by(position) %>%
+  summarise(
+    `Field avg mult (own-weighted)` = weighted.mean(multiple, own),
+    `Slate avg mult (unweighted)`   = mean(multiple),
+    `Chalk (20%+) 5x rate`          = mean(hit5[own >= 20]),
+    `Sub-5% 5x rate`                = mean(hit5[own < 5]),
+    `5x hits from sub-5% players`   = sum(hit5 & own < 5) / pmax(sum(hit5), 1),
+    `Avg own of 5x hits`            = mean(own[hit5]),
+    .groups = "drop") %>%
+  gt() %>%
+  tab_header("Where the field's exposure went", Data_Label) %>%
+  fmt_number(contains("mult"), decimals = 2) %>%
+  fmt_percent(c(contains("rate"), contains("from")), decimals = 1) %>%
+  fmt_number(`Avg own of 5x hits`, decimals = 1, pattern = "{x}%")
+```
+
+## Chalk busts vs. low-owned smashes
+
+```{r chalk-vs-contrarian}
+own_df %>%
+  mutate(group = case_when(own >= 20 & multiple < 2 ~ "Chalk bust (20%+, <2x)",
+                           own >= 20 & hit4       ~ "Chalk hit (20%+, 4x+)",
+                           own < 5   & hit5       ~ "Contrarian smash (<5%, 5x+)",
+                           TRUE ~ NA_character_)) %>%
+  filter(!is.na(group)) %>%
+  group_by(group, position) %>%
+  summarise(n = n(),
+            avg_salary = mean(salary), avg_total = mean(total_line, na.rm = TRUE),
+            avg_spread = mean(team_spread, na.rm = TRUE),
+            avg_itt = mean(implied_tt, na.rm = TRUE),
+            home_pct = mean(venue == "Home", na.rm = TRUE),
+            bonus_pct = mean(bonus > 0),
+            .groups = "drop") %>%
+  gt(groupname_col = "group") %>%
+  tab_header("Profile: chalk busts vs. contrarian smashes", Data_Label) %>%
+  fmt_currency(avg_salary, decimals = 0) %>%
+  fmt_number(c(avg_total, avg_spread, avg_itt), decimals = 1) %>%
+  fmt_percent(c(home_pct, bonus_pct), decimals = 0)
+```
+
+## Biggest leverage plays of the season
+
+```{r top-leverage}
+own_df %>%
+  filter(hit4) %>%
+  mutate(lev_points = dk_points * (1 - own / 100)) %>%   # points the field mostly missed
+  arrange(desc(lev_points)) %>%
+  transmute(Wk = week, Player = name, Pos = position, Team = team,
+            Salary = salary, `Own %` = own, `DK Pts` = dk_points,
+            Mult = round(multiple, 2), `Model 5x %` = p5,
+            Total = total_line, Spread = team_spread, ITT = round(implied_tt, 1)) %>%
+  head(30) %>%
+  gt() %>%
+  tab_header("Top leverage hits (4x+ ranked by points x unowned share)", Data_Label) %>%
+  fmt_currency(Salary, decimals = 0) %>%
+  fmt_number(`Own %`, decimals = 1) %>%
+  fmt_percent(`Model 5x %`, decimals = 0)
+```
+
+## Recurring underowned profiles (repeatable patterns)
+
+```{r underowned-profiles}
+# Players the model rated as live (top-third p5 at position-week) but the field
+# rostered under 8%: how often did they pay off?
+own_df %>%
+  group_by(week, position) %>%
+  mutate(p5_rank_pct = percent_rank(p5)) %>%
+  ungroup() %>%
+  mutate(profile = case_when(p5_rank_pct >= 2/3 & own < 8  ~ "Live & underowned",
+                             p5_rank_pct >= 2/3 & own >= 8 ~ "Live & popular",
+                             TRUE ~ "Other")) %>%
+  group_by(position, profile) %>%
+  summarise(n = n(), avg_own = mean(own), `3x` = mean(hit3), `4x` = mean(hit4),
+            `5x` = mean(hit5), avg_mult = mean(multiple), .groups = "drop") %>%
+  gt(groupname_col = "position") %>%
+  tab_header("Model-favored players: underowned vs. popular", Data_Label) %>%
+  fmt_number(c(avg_own, avg_mult), decimals = 1) %>%
+  fmt_percent(c(`3x`, `4x`, `5x`), decimals = 1)
+
+# Which teams/conditions produced underowned 4x+ games repeatedly
+own_df %>%
+  filter(hit4, own < 8) %>%
+  count(team, position, name = "underowned_4x_games", sort = TRUE) %>%
+  filter(underowned_4x_games >= 2) %>%
+  gt() %>%
+  tab_header("Teams producing repeated underowned 4x+ games", "own < 8%")
+```
