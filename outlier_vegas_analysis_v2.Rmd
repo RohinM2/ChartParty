@@ -1,0 +1,581 @@
+---
+title: "In-Week Fantasy Outliers: Vegas, Divisional, Pace & Game-Environment Factors"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6.5, dpi = 200)
+
+library(tidyverse)
+library(nflreadr)
+library(gt)
+
+# ======================= PARAMETERS =======================
+SEASONS  <- 2020:get_current_season()   # last season = out-of-sample test set
+THRU_WK  <- 10                          # last week of the current season to include
+SCORING  <- "fantasy_points_ppr"        # or "fantasy_points" (standard)
+Z_CUT    <- 2                           # outlier = z-score >= this within week & position
+
+PRIOR_N         <- 4                    # rolling window for all "prior" stats (team games)
+MIN_PRIOR_GAMES <- 2                    # need at least this many prior games in-season
+
+# Player pool is defined from PRIOR volume only (knowable before kickoff), so the
+# outlier flag is not conditioned on what happened in the game itself.
+MIN_PRIOR_VOL <- c(QB = 15, RB = 6, WR = 3, TE = 2.5)  # QB att | RB car+tgt | WR/TE tgt, per game
+
+CREDIT <- "@rohinmishra / rohinm.substack.com"
+# ==========================================================
+```
+
+```{r helpers-data}
+# Mean of the previous k values (excludes the current game). NA if < min_n available.
+roll_prior <- function(x, k = PRIOR_N, min_n = MIN_PRIOR_GAMES) {
+  m <- do.call(cbind, lapply(seq_len(k), function(i) dplyr::lag(x, i)))
+  n <- rowSums(!is.na(m))
+  out <- rowMeans(m, na.rm = TRUE)
+  out[n < min_n] <- NA_real_
+  out
+}
+
+# Quintile bins with readable labels
+qbin <- function(x, k = 5) {
+  labs <- c("Q1 (low)", paste0("Q", 2:(k - 1)), paste0("Q", k, " (high)"))
+  factor(labs[ntile(x, k)], levels = labs)
+}
+```
+
+```{r data}
+# ---- 1) Schedules -> one row per team-game (home + away built directly so
+#         neutral-site spreads keep the right sign) ----
+sched <- load_schedules(SEASONS) %>%
+  filter(game_type == "REG", !is.na(result),
+         season < max(SEASONS) | week <= THRU_WK)
+
+lines <- bind_rows(
+  sched %>% transmute(game_id, season, week, team = home_team, opponent = away_team,
+                      venue = if_else(location == "Neutral", "Neutral", "Home"),
+                      team_spread = spread_line, rest = home_rest,
+                      team_score = home_score, opp_score = away_score),
+  sched %>% transmute(game_id, season, week, team = away_team, opponent = home_team,
+                      venue = if_else(location == "Neutral", "Neutral", "Away"),
+                      team_spread = -spread_line, rest = away_rest,
+                      team_score = away_score, opp_score = home_score)
+) %>%
+  left_join(sched %>% select(game_id, total_line, div_game, roof, temp, wind, weekday, gametime),
+            by = "game_id") %>%
+  mutate(
+    implied_tt = total_line / 2 + team_spread / 2,          # spread + = favored
+    game_total = team_score + opp_score,
+    divisional = if_else(div_game == 1, "Divisional", "Non-divisional"),
+    indoor     = roof %in% c("dome", "closed"),
+    wind_f     = if_else(indoor, 0, as.numeric(wind)),
+    temp_f     = if_else(indoor, 70, as.numeric(temp)),
+    primetime  = coalesce(weekday != "Sunday" | gametime >= "19:00", FALSE),
+    rest_bin   = factor(case_when(rest <= 5  ~ "Short (<=5 days)",
+                                  rest >= 10 ~ "Long / off bye (10+)",
+                                  TRUE       ~ "Normal (6-9)"),
+                        levels = c("Short (<=5 days)", "Normal (6-9)", "Long / off bye (10+)"))
+  )
+
+# ---- 2) Team pace & PROE per game from play-by-play ----
+pbp_cols <- c("game_id", "season", "week", "season_type", "posteam", "defteam", "pass", "rush",
+              "qb_kneel", "qb_spike", "xpass", "wp", "down", "half_seconds_remaining")
+
+pbp <- map_dfr(SEASONS, ~ load_pbp(.x) %>% select(any_of(pbp_cols))) %>%
+  filter(season_type == "REG", !is.na(posteam), pass == 1 | rush == 1,
+         coalesce(qb_kneel, 0) == 0, coalesce(qb_spike, 0) == 0)
+
+team_game <- pbp %>%
+  mutate(neutral = down %in% 1:3 & between(wp, 0.2, 0.8) &
+                   half_seconds_remaining > 120 & !is.na(xpass)) %>%
+  group_by(game_id, season, week, team = posteam) %>%
+  summarise(off_plays = n(),
+            proe      = 100 * mean((pass - xpass)[neutral]),
+            .groups = "drop") %>%
+  left_join(pbp %>% count(game_id, team = defteam, name = "def_plays"),
+            by = c("game_id", "team"))
+
+team_prior <- team_game %>%
+  arrange(team, season, week) %>%
+  group_by(team, season) %>%
+  mutate(team_plays_p4     = roll_prior(off_plays),
+         team_def_plays_p4 = roll_prior(def_plays),
+         team_proe_p4      = roll_prior(proe)) %>%
+  ungroup() %>%
+  select(season, week, team, team_plays_p4, team_def_plays_p4, team_proe_p4)
+
+# ---- 3) Weekly player stats ----
+ps_raw <- tryCatch(load_player_stats(SEASONS, summary_level = "week"),
+                   error = function(e) load_player_stats(SEASONS))       # older nflreadr
+if (!"team" %in% names(ps_raw) && "recent_team" %in% names(ps_raw))
+  ps_raw <- rename(ps_raw, team = recent_team)
+
+ps_all <- ps_raw %>%
+  filter(season_type == "REG", position %in% c("QB", "RB", "WR", "TE")) %>%
+  transmute(player_id, player = player_display_name, position, season, week, team,
+            attempts = coalesce(attempts, 0), carries = coalesce(carries, 0),
+            targets  = coalesce(targets, 0),
+            fp       = coalesce(.data[[SCORING]], 0)) %>%
+  mutate(vol = case_when(position == "QB" ~ attempts,
+                         position == "RB" ~ carries + targets,
+                         TRUE             ~ targets)) %>%
+  semi_join(lines, by = c("season", "week", "team"))
+
+team_vol <- ps_all %>%
+  group_by(season, week, team) %>%
+  summarise(team_carries = sum(carries), team_targets = sum(targets), .groups = "drop")
+
+ps_all <- ps_all %>%
+  left_join(team_vol, by = c("season", "week", "team")) %>%
+  mutate(opp_share = (carries + targets) / pmax(team_carries + team_targets, 1)) %>%
+  arrange(player_id, season, week) %>%
+  group_by(player_id, season) %>%
+  mutate(fp_p4    = roll_prior(fp),
+         vol_p4   = roll_prior(vol),
+         share_p4 = roll_prior(opp_share)) %>%
+  ungroup()
+
+# ---- 4) Defense: fantasy points allowed to each position, prior 4 ----
+def_allowed <- ps_all %>%
+  left_join(lines %>% select(season, week, team, opponent), by = c("season", "week", "team")) %>%
+  group_by(season, week, defteam = opponent, position) %>%
+  summarise(fp_allowed = sum(fp), .groups = "drop") %>%
+  arrange(defteam, position, season, week) %>%
+  group_by(defteam, position, season) %>%
+  mutate(opp_fp_allowed_p4 = roll_prior(fp_allowed)) %>%
+  ungroup() %>%
+  select(season, week, defteam, position, opp_fp_allowed_p4)
+
+# ---- 5) Assemble + outlier flag ----
+df <- ps_all %>%
+  inner_join(lines, by = c("season", "week", "team")) %>%
+  left_join(team_prior, by = c("season", "week", "team")) %>%
+  left_join(team_prior %>% select(season, week, opponent = team,
+                                  opp_plays_allowed_p4 = team_def_plays_p4,
+                                  opp_plays_p4 = team_plays_p4),
+            by = c("season", "week", "opponent")) %>%
+  left_join(def_allowed, by = c("season", "week", "opponent" = "defteam", "position")) %>%
+  filter(!is.na(vol_p4), vol_p4 >= MIN_PRIOR_VOL[position]) %>%
+  group_by(season, week, position) %>%
+  mutate(z        = (fp - mean(fp)) / sd(fp),
+         pos_rank = min_rank(desc(fp)),
+         outlier  = z >= Z_CUT) %>%
+  ungroup() %>%
+  mutate(
+    position      = factor(position, levels = c("QB", "RB", "WR", "TE")),
+    total_bin     = cut(total_line, c(-Inf, 40.5, 43.5, 46.5, 49.5, Inf),
+                        labels = c("<=40.5", "41-43.5", "44-46.5", "47-49.5", "50+")),
+    spread_bin    = cut(team_spread, c(-Inf, -7.5, -3.5, -0.5, 0.5, 3.5, 7.5, Inf),
+                        labels = c("Dog 8+", "Dog 4-7.5", "Dog 1-3.5", "PK",
+                                   "Fav 1-3.5", "Fav 4-7.5", "Fav 8+")),
+    itt_bin       = cut(implied_tt, c(-Inf, 19, 21.5, 24, 26.5, Inf),
+                        labels = c("<19", "19-21.5", "21.5-24", "24-26.5", "26.5+")),
+    plays_bin     = qbin(team_plays_p4),
+    opp_allow_bin = qbin(opp_plays_allowed_p4),
+    proe_bin      = qbin(team_proe_p4),
+    wind_bin      = cut(wind_f, c(-Inf, 9.99, 14.99, Inf), labels = c("<10 mph", "10-15 mph", "15+ mph")),
+    roof_bin      = if_else(indoor, "Indoor", "Outdoor"),
+    prime_bin     = if_else(primetime, "Primetime / non-Sunday", "Sunday day")
+  ) %>%
+  group_by(position) %>%
+  mutate(oppfp_bin = qbin(opp_fp_allowed_p4)) %>%      # position-specific defense quality
+  ungroup()
+
+Data_Label <- sprintf("%d-%d REG (thru %d Wk %d) | outlier = z >= %.1f vs. week/position field | priors = last %d games",
+                      min(SEASONS), max(SEASONS), max(SEASONS), THRU_WK, Z_CUT, PRIOR_N)
+```
+
+```{r diagnostics}
+list(
+  player_games    = nrow(df),
+  outliers        = sum(df$outlier),
+  by_position     = df %>% count(position, outlier) %>% pivot_wider(names_from = outlier, values_from = n),
+  missing_priors  = df %>% summarise(across(c(team_plays_p4, opp_plays_allowed_p4, team_proe_p4,
+                                              opp_fp_allowed_p4, fp_p4, share_p4, wind_f, temp_f),
+                                            ~ mean(is.na(.x)))),
+  divisional_rows = df %>% count(divisional)
+)
+```
+
+```{r helpers-plot}
+rate_by <- function(data, var, flag = "outlier") {
+  base <- data %>% group_by(position) %>% summarise(base = mean(.data[[flag]]), .groups = "drop")
+  data %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(position, level = .data[[var]]) %>%
+    summarise(n = n(), hits = sum(.data[[flag]]), .groups = "drop") %>%
+    mutate(rate = hits / n, z95 = 1.96,
+           lo = (rate + z95^2/(2*n) - z95*sqrt(rate*(1-rate)/n + z95^2/(4*n^2))) / (1 + z95^2/n),
+           hi = (rate + z95^2/(2*n) + z95*sqrt(rate*(1-rate)/n + z95^2/(4*n^2))) / (1 + z95^2/n)) %>%
+    left_join(base, by = "position") %>%
+    mutate(lift = rate / base)
+}
+
+pos_cols <- c(QB = "#d7301f", RB = "#2171b5", WR = "#238b45", TE = "#6a51a3")
+
+plot_rate <- function(r, xlab, title) {
+  ggplot(r, aes(level, rate, fill = position)) +
+    geom_col(width = 0.7, alpha = 0.9) +
+    geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.2, colour = "grey30") +
+    geom_hline(aes(yintercept = base), linetype = "dashed", colour = "grey40") +
+    geom_text(aes(label = paste0("n=", n)), y = 0, vjust = -0.4, size = 2.3, colour = "white") +
+    facet_wrap(~ position, nrow = 1) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    scale_fill_manual(values = pos_cols, guide = "none") +
+    labs(x = xlab, y = "Outlier rate", title = title,
+         subtitle = paste0(Data_Label, "\ndashed = position baseline | 95% CI"),
+         caption = paste("Data: nflreadr / nflfastR |", CREDIT)) +
+    theme_bw() +
+    theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 8, hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+}
+
+chi_p <- function(data, var) {
+  data %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(position) %>%
+    summarise(p = tryCatch(suppressWarnings(chisq.test(table(.data[[var]], outlier))$p.value),
+                           error = function(e) NA_real_),
+              .groups = "drop")
+}
+```
+
+# Vegas factors
+
+## Home vs. Away
+
+```{r home-away}
+plot_rate(rate_by(filter(df, venue != "Neutral"), "venue"), NULL, "Outlier Rate: Home vs. Away")
+```
+
+## Game total
+
+```{r totals}
+plot_rate(rate_by(df, "total_bin"), "Closing game total", "Outlier Rate by Vegas Game Total")
+```
+
+## Spread
+
+```{r spreads}
+plot_rate(rate_by(df, "spread_bin"), "Team spread", "Outlier Rate by Point Spread")
+```
+
+## Implied team total
+
+```{r itt}
+plot_rate(rate_by(df, "itt_bin"), "Implied team total", "Outlier Rate by Implied Team Total")
+```
+
+# Divisional games
+
+## Outlier rate: divisional vs. non-divisional
+
+```{r div-rate}
+plot_rate(rate_by(df, "divisional"), NULL, "Outlier Rate: Divisional vs. Non-Divisional")
+
+df %>%
+  group_by(position) %>%
+  summarise(
+    div_rate    = mean(outlier[divisional == "Divisional"]),
+    nondiv_rate = mean(outlier[divisional == "Non-divisional"]),
+    n_div       = sum(divisional == "Divisional"),
+    p = prop.test(c(sum(outlier[divisional == "Divisional"]), sum(outlier[divisional == "Non-divisional"])),
+                  c(sum(divisional == "Divisional"), sum(divisional == "Non-divisional")))$p.value,
+    .groups = "drop") %>%
+  gt() %>%
+  tab_header("Divisional outlier rate test (2-sample proportion test)", Data_Label) %>%
+  fmt_percent(c(div_rate, nondiv_rate), decimals = 1) %>%
+  fmt_number(p, decimals = 3)
+```
+
+## Do divisional games score differently vs. the closing total?
+
+```{r div-totals}
+game_lvl <- sched %>%
+  transmute(game_id, divisional = if_else(div_game == 1, "Divisional", "Non-divisional"),
+            total_line, actual = home_score + away_score,
+            vs_line = actual - total_line, over = actual > total_line)
+
+game_lvl %>%
+  group_by(divisional) %>%
+  summarise(games = n(), avg_line = mean(total_line, na.rm = TRUE), avg_actual = mean(actual),
+            avg_vs_line = mean(vs_line, na.rm = TRUE), over_rate = mean(over, na.rm = TRUE),
+            .groups = "drop") %>%
+  gt() %>%
+  tab_header("Divisional games vs. the closing total",
+             sprintf("Welch t-test on (actual - line): p = %.3f",
+                     t.test(vs_line ~ divisional, data = game_lvl)$p.value)) %>%
+  fmt_number(c(avg_line, avg_actual, avg_vs_line), decimals = 1) %>%
+  fmt_percent(over_rate, decimals = 1)
+```
+
+## Divisional correlation: stacks and bring-backs
+
+```{r div-correlation}
+# QB1 = highest-volume QB in the team-game; Pass-catcher 1 = WR/TE with highest prior opportunity share
+qb1 <- df %>% filter(position == "QB") %>%
+  group_by(game_id, team) %>% slice_max(vol, n = 1, with_ties = FALSE) %>% ungroup() %>%
+  select(game_id, team, opponent, divisional, qb_fp = fp)
+
+pc1 <- df %>% filter(position %in% c("WR", "TE"), !is.na(share_p4)) %>%
+  group_by(game_id, team) %>% slice_max(share_p4, n = 1, with_ties = FALSE) %>% ungroup() %>%
+  select(game_id, team, pc1_fp = fp)
+
+team_fp <- ps_all %>% group_by(season, week, team) %>% summarise(team_fp = sum(fp), .groups = "drop") %>%
+  inner_join(lines %>% select(game_id, season, week, team, opponent, divisional),
+             by = c("season", "week", "team"))
+
+pairs <- list(
+  `QB + own pass-catcher (stack)` =
+    qb1 %>% inner_join(pc1, by = c("game_id", "team")) %>% transmute(divisional, a = qb_fp, b = pc1_fp),
+  `QB + opp pass-catcher (bring-back)` =
+    qb1 %>% inner_join(pc1, by = c("game_id", "opponent" = "team")) %>% transmute(divisional, a = qb_fp, b = pc1_fp),
+  `Team skill FP vs. opponent skill FP` =
+    team_fp %>% inner_join(team_fp %>% select(game_id, team, opp_fp = team_fp),
+                           by = c("game_id", "opponent" = "team")) %>%
+      filter(team < opponent) %>% transmute(divisional, a = team_fp, b = opp_fp)
+)
+
+fisher_p <- function(r1, n1, r2, n2) 2 * pnorm(-abs((atanh(r1) - atanh(r2)) / sqrt(1/(n1 - 3) + 1/(n2 - 3))))
+
+imap_dfr(pairs, function(d, nm) {
+  s <- d %>% group_by(divisional) %>% summarise(r = cor(a, b, use = "complete.obs"), n = n(), .groups = "drop")
+  dv <- filter(s, divisional == "Divisional"); nd <- filter(s, divisional == "Non-divisional")
+  tibble(pair = nm, r_div = dv$r, n_div = dv$n, r_nondiv = nd$r, n_nondiv = nd$n,
+         diff = dv$r - nd$r, p = fisher_p(dv$r, dv$n, nd$r, nd$n))
+}) %>%
+  gt() %>%
+  tab_header("Fantasy-point correlation: divisional vs. non-divisional",
+             "Fisher z-test for difference in correlations") %>%
+  fmt_number(c(r_div, r_nondiv, diff), decimals = 3) %>%
+  fmt_number(p, decimals = 3)
+```
+
+# Pace, PROE & matchup factors (all prior-4, pre-game)
+
+## Team plays per game
+
+```{r plays}
+plot_rate(rate_by(df, "plays_bin"), "Team offensive plays/game, prior 4 (quintile)",
+          "Outlier Rate by Team Pace")
+```
+
+## Opponent plays allowed per game
+
+```{r opp-plays}
+plot_rate(rate_by(df, "opp_allow_bin"), "Opponent plays allowed/game, prior 4 (quintile)",
+          "Outlier Rate by Opponent Plays Allowed")
+```
+
+## Team PROE
+
+```{r proe}
+plot_rate(rate_by(df, "proe_bin"), "Team neutral PROE, prior 4 (quintile)",
+          "Outlier Rate by Team Pass Rate Over Expected")
+```
+
+## Opponent fantasy points allowed to position
+
+```{r opp-fp}
+plot_rate(rate_by(df, "oppfp_bin"), "Opp FP allowed to position, prior 4 (quintile within position)",
+          "Outlier Rate by Defensive Matchup")
+```
+
+## Factor screen: every factor at once
+
+```{r screen, fig.height=14}
+screen_vars <- c(`Divisional`                 = "divisional",
+                 `Venue`                      = "venue",
+                 `Game total`                 = "total_bin",
+                 `Spread`                     = "spread_bin",
+                 `Team plays/g (p4)`          = "plays_bin",
+                 `Opp plays allowed/g (p4)`   = "opp_allow_bin",
+                 `Team PROE (p4)`             = "proe_bin",
+                 `Opp FP allowed to pos (p4)` = "oppfp_bin",
+                 `Roof`                       = "roof_bin",
+                 `Wind`                       = "wind_bin",
+                 `Rest`                       = "rest_bin",
+                 `Kickoff`                    = "prime_bin")
+
+screen <- imap_dfr(screen_vars, ~ rate_by(filter(df, venue != "Neutral"), .x) %>%
+                     mutate(factor = .y, level = as.character(level))) %>%
+  mutate(factor = factor(factor, levels = names(screen_vars)))
+
+ggplot(screen, aes(lift, fct_rev(fct_inorder(level)), fill = lift > 1)) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_errorbarh(aes(xmin = lo / base, xmax = hi / base), height = 0.25, colour = "grey30") +
+  geom_vline(xintercept = 1, colour = "grey40") +
+  facet_grid(factor ~ position, scales = "free_y", space = "free_y") +
+  scale_fill_manual(values = c(`TRUE` = "#1b7837", `FALSE` = "#b2182b"), guide = "none") +
+  labs(x = "Lift vs. position baseline outlier rate (1 = average)", y = NULL,
+       title = "Outlier Lift by Factor", subtitle = Data_Label,
+       caption = paste("Data: nflreadr / nflfastR |", CREDIT)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5),
+        strip.text.y = element_text(angle = 0, size = 7),
+        axis.text.y = element_text(size = 7))
+```
+
+# Testing: which factors matter independently?
+
+```{r model-setup}
+num_vars <- c("total_line", "team_spread", "team_plays_p4", "opp_plays_allowed_p4", "team_proe_p4",
+              "opp_fp_allowed_p4", "fp_p4", "share_p4", "wind_f", "temp_f", "rest")
+
+dfm <- df %>%
+  filter(venue != "Neutral") %>%
+  mutate(home = as.numeric(venue == "Home"),
+         div  = as.numeric(div_game == 1),
+         indoor_n    = as.numeric(indoor),
+         primetime_n = as.numeric(primetime)) %>%
+  group_by(position) %>%
+  mutate(across(all_of(num_vars), ~ as.numeric(scale(.x)), .names = "{.col}_z")) %>%   # per-SD effects
+  ungroup()
+
+model_terms <- function(pos) {
+  v <- c(paste0(num_vars, "_z"), "home", "div", "indoor_n", "primetime_n")
+  if (pos == "QB") v <- setdiff(v, "share_p4_z")
+  v
+}
+model_data <- function(pos) {
+  dfm %>% filter(position == pos) %>% drop_na(all_of(c("outlier", model_terms(pos))))
+}
+
+term_labels <- c(total_line_z = "Game total (+1 SD)", team_spread_z = "Spread, favored (+1 SD)",
+                 team_plays_p4_z = "Team plays/g p4 (+1 SD)", opp_plays_allowed_p4_z = "Opp plays allowed/g p4 (+1 SD)",
+                 team_proe_p4_z = "Team PROE p4 (+1 SD)", opp_fp_allowed_p4_z = "Opp FP allowed to pos p4 (+1 SD)",
+                 fp_p4_z = "Player FP/g p4 (+1 SD)", share_p4_z = "Player opp. share p4 (+1 SD)",
+                 wind_f_z = "Wind (+1 SD)", temp_f_z = "Temperature (+1 SD)", rest_z = "Rest days (+1 SD)",
+                 home = "Home", div = "Divisional game", indoor_n = "Indoor", primetime_n = "Primetime / non-Sunday")
+
+fits <- map(set_names(levels(df$position)), function(pos) {
+  d <- model_data(pos)
+  m <- glm(reformulate(model_terms(pos), "outlier"), data = d, family = binomial)
+  co <- summary(m)$coefficients[-1, , drop = FALSE]
+  lrt <- drop1(m, test = "LRT")
+  list(
+    n = nrow(d),
+    coefs = tibble(term = rownames(co), est = co[, 1], se = co[, 2]) %>%
+      mutate(odds_ratio = exp(est), lo = exp(est - 1.96 * se), hi = exp(est + 1.96 * se)),
+    lrt = tibble(term = rownames(lrt), lrt_chisq = lrt$LRT, p = lrt[["Pr(>Chi)"]]) %>%
+      filter(term != "<none>")
+  )
+})
+
+coef_tbl <- imap_dfr(fits, ~ .x$coefs %>% left_join(.x$lrt, by = "term") %>% mutate(position = .y, n = .x$n)) %>%
+  mutate(position = factor(position, levels = levels(df$position)),
+         label = term_labels[term],
+         sig = if_else(p < 0.05, "p < 0.05", "n.s."))
+```
+
+## Odds ratios (all factors in one model, per position)
+
+```{r forest, fig.height=8}
+ggplot(coef_tbl, aes(odds_ratio, fct_rev(factor(label, levels = term_labels)), colour = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(xmin = lo, xmax = hi), size = 0.3) +
+  facet_wrap(~ position, nrow = 1) +
+  scale_x_log10() +
+  scale_colour_manual(values = c(`p < 0.05` = "#d7301f", n.s. = "grey60")) +
+  labs(x = "Odds ratio of an outlier week (log scale)", y = NULL, colour = "LRT",
+       title = "Independent Effect of Each Factor",
+       subtitle = paste0(Data_Label, "\nlogistic regression, all factors together; continuous = per 1 SD"),
+       caption = paste("Data: nflreadr / nflfastR |", CREDIT)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5), legend.position = "top")
+```
+
+## Factor significance ranking
+
+```{r significance}
+coef_tbl %>%
+  select(position, label, odds_ratio, lrt_chisq, p) %>%
+  pivot_wider(names_from = position, values_from = c(odds_ratio, lrt_chisq, p),
+              names_glue = "{position}_{.value}") %>%
+  mutate(avg_chisq = rowMeans(across(ends_with("_lrt_chisq")), na.rm = TRUE)) %>%
+  arrange(desc(avg_chisq)) %>%
+  select(label, starts_with("QB"), starts_with("RB"), starts_with("WR"), starts_with("TE")) %>%
+  gt() %>%
+  tab_header("Likelihood-ratio test: drop each factor from the full model",
+             "sorted by average LRT chi-square across positions") %>%
+  fmt_number(ends_with("_odds_ratio"), decimals = 2) %>%
+  fmt_number(ends_with("_lrt_chisq"), decimals = 1) %>%
+  fmt_number(ends_with("_p"), decimals = 3) %>%
+  data_color(columns = ends_with("_p"),
+             fn = scales::col_numeric(c("#1b7837", "white"), domain = c(0, 0.2), na.color = "white"))
+
+# Univariate check (binned factors, chi-square) for comparison
+imap_dfr(screen_vars, ~ chi_p(filter(df, venue != "Neutral"), .x) %>% mutate(factor = .y)) %>%
+  pivot_wider(names_from = position, values_from = p) %>%
+  gt() %>%
+  tab_header("Univariate chi-square p-values (binned factor vs. outlier)",
+             "does NOT control for other factors") %>%
+  fmt_number(-factor, decimals = 3)
+```
+
+## Out-of-sample test: do the extra factors add predictive value?
+
+```{r oos}
+auc <- function(y, p) {
+  ok <- !is.na(y) & !is.na(p); y <- y[ok]; p <- p[ok]
+  r <- rank(p); n1 <- sum(y); n0 <- sum(!y)
+  (sum(r[y]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+map_dfr(levels(df$position), function(pos) {
+  d  <- model_data(pos)
+  tr <- filter(d, season <  max(SEASONS))
+  te <- filter(d, season == max(SEASONS))
+  specs <- list(
+    `Vegas only`          = c("total_line_z", "team_spread_z", "home"),
+    `Vegas + player prior` = c("total_line_z", "team_spread_z", "home", "fp_p4_z",
+                               if (pos != "QB") "share_p4_z"),
+    `Full model`          = model_terms(pos)
+  )
+  imap_dfr(specs, function(v, nm) {
+    m <- glm(reformulate(v, "outlier"), data = tr, family = binomial)
+    tibble(position = pos, model = nm,
+           auc = auc(te$outlier, predict(m, newdata = te, type = "response")),
+           n_train = nrow(tr), n_test = nrow(te), test_outliers = sum(te$outlier))
+  })
+}) %>%
+  pivot_wider(id_cols = c(position, n_train, n_test, test_outliers), names_from = model, values_from = auc) %>%
+  gt() %>%
+  tab_header(sprintf("Out-of-sample AUC: train %d-%d, test %d (Wks 3-%d)",
+                     min(SEASONS), max(SEASONS) - 1, max(SEASONS), THRU_WK),
+             "0.5 = coin flip; gains of ~0.02+ are meaningful") %>%
+  fmt_number(c(`Vegas only`, `Vegas + player prior`, `Full model`), decimals = 3)
+```
+
+# Context
+
+## Did the game actually shoot out? (explains, does not predict)
+
+```{r actual-vs-line}
+df %>%
+  mutate(total_miss = cut(game_total - total_line, c(-Inf, -10, -3, 3, 10, Inf),
+                          labels = c("Under 10+", "Under 3-10", "Within 3", "Over 3-10", "Over 10+"))) %>%
+  rate_by("total_miss") %>%
+  plot_rate("Actual game total vs. closing line", "Outlier Rate by Game Script vs. Vegas")
+```
+
+## Biggest outliers in the current season
+
+```{r current-outliers}
+df %>%
+  filter(season == max(SEASONS), outlier) %>%
+  arrange(desc(z)) %>%
+  transmute(Wk = week, Player = player, Pos = position, Team = team, Opp = opponent,
+            Venue = venue, Div = if_else(div_game == 1, "Y", ""),
+            Total = total_line, Spread = team_spread, ITT = round(implied_tt, 1),
+            `Plays p4` = round(team_plays_p4, 1), `Opp allow p4` = round(opp_plays_allowed_p4, 1),
+            `PROE p4` = round(team_proe_p4, 1), FP = round(fp, 1), z = round(z, 2)) %>%
+  head(40) %>%
+  gt() %>%
+  tab_header(sprintf("%d in-week outliers (z >= %.1f)", max(SEASONS), Z_CUT))
+```
